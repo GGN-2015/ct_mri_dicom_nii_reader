@@ -193,6 +193,19 @@ class BodyDataSlice:
         self._image_type = image_type
         self._slice_data = data
 
+    def to_numpy(self, copy:bool=False) -> numpy.ndarray:
+        """Return the underlying NumPy array of this slice.
+
+        Args:
+            copy: When true, return a copy instead of the internal array.
+
+        Returns:
+            The internal 2-D array, or a copy of it when ``copy=True``.
+        """
+        if copy:
+            return self._slice_data.copy()
+        return self._slice_data
+
     def get_pos(self, x:int, y:int) -> float:
         return float(self._slice_data[x, y])
 
@@ -237,6 +250,19 @@ class BodyData:
         self._body_data = data
         self._image_type = image_type
         self._mmpd = mmpd
+
+    def to_numpy(self, copy:bool=False) -> numpy.ndarray:
+        """Return the underlying NumPy array of this volume.
+
+        Args:
+            copy: When true, return a copy instead of the internal array.
+
+        Returns:
+            The internal 3-D array, or a copy of it when ``copy=True``.
+        """
+        if copy:
+            return self._body_data.copy()
+        return self._body_data
 
     def unify_to_mask(self) -> None:
         s1 = (self._body_data >= 0.5)

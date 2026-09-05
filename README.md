@@ -174,6 +174,7 @@ All loaders accept `get_mmpd()` / `set_mmpd()` for the output voxel width.
 | Method | Description |
 | --- | --- |
 | `from_array(data, image_type, mmpd)` | Wrap a NumPy array in LPS order |
+| `to_numpy(copy=False)` | Return the internal 3-D NumPy array (copy only when `copy=True`) |
 | `get_initialized()` | Whether `image_type` has been set |
 | `get_type()` | `"ct"`, `"mri"`, `"mask"` or `None` |
 | `unify_to_mask()` | Binarize values to `int8` at threshold 0.5 |
@@ -193,6 +194,7 @@ All loaders accept `get_mmpd()` / `set_mmpd()` for the output voxel width.
 A 2-D plane view returned by `BodyData.get_slice_*`:
 
 - `get_pos(x, y)`, `get_size()` -> `(x, y)`,
+- `to_numpy(copy=False)` -> internal 2-D NumPy array,
 - `get_mmpd()` / `set_mmpd()`, `get_body_data()` -> owning `BodyData` or `None`,
 - `clone()` -> deep copy,
 - `gui_preview()` -> blocking grayscale window.
