@@ -20,6 +20,9 @@ available as :meth:`BodyData.gui_preview`.
 
 from __future__ import annotations
 
+import queue
+import threading
+from collections import OrderedDict
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -38,7 +41,7 @@ def _air_value(image_type: Optional[str]) -> float:
     return -1024.0 if image_type == "ct" else 0.0
 
 
-def _display_window(body_data: BodyData) -> tuple[float, float]:
+def display_window(body_data: BodyData) -> tuple[float, float]:
     """Estimate the bounded display window used by multimodal fusion."""
     flat = np.asarray(body_data._body_data).reshape(-1)
     stride = max(1, flat.size // 500_000)
@@ -72,7 +75,12 @@ def _display_window(body_data: BodyData) -> tuple[float, float]:
     return low, high
 
 
-def _normalize_to_u8(
+def _display_window(body_data: BodyData) -> tuple[float, float]:
+    """Compatibility forwarder for :func:`display_window`."""
+    return display_window(body_data)
+
+
+def normalize_to_u8(
     values: np.ndarray, window: tuple[float, float]
 ) -> np.ndarray:
     low, high = window
@@ -83,6 +91,13 @@ def _normalize_to_u8(
     return np.ascontiguousarray(
         np.clip(normalized * 255.0, 0.0, 255.0), dtype=np.uint8
     )
+
+
+def _normalize_to_u8(
+    values: np.ndarray, window: tuple[float, float]
+) -> np.ndarray:
+    """Compatibility forwarder for :func:`normalize_to_u8`."""
+    return normalize_to_u8(values, window)
 
 
 def _edge_strength(image: np.ndarray) -> np.ndarray:
@@ -110,8 +125,8 @@ def _compose_multimodal_fusion(
     moving_window: tuple[float, float],
 ) -> np.ndarray:
     """Compose the reference amber/cyan edge fusion as an RGB image."""
-    fixed_u8 = _normalize_to_u8(fixed, fixed_window)
-    moving_u8 = _normalize_to_u8(moving, moving_window)
+    fixed_u8 = normalize_to_u8(fixed, fixed_window)
+    moving_u8 = normalize_to_u8(moving, moving_window)
     fixed_rgb = np.repeat(fixed_u8[:, :, None], 3, axis=2).astype(np.float32)
 
     fusion = fixed_rgb * 0.32
@@ -179,7 +194,7 @@ def _resampled_size(
     )
 
 
-def _resample_to_mmpd(body_data: BodyData, mmpd: float) -> BodyData:
+def resample_to_mmpd(body_data: BodyData, mmpd: float) -> BodyData:
     """Resample one volume onto the unified grid spacing, keeping its extent."""
     import SimpleITK as sitk
 
@@ -221,6 +236,11 @@ def _resample_to_mmpd(body_data: BodyData, mmpd: float) -> BodyData:
     result = BodyData()
     result.from_array(array, image_type, float(mmpd))
     return result
+
+
+def _resample_to_mmpd(body_data: BodyData, mmpd: float) -> BodyData:
+    """Compatibility forwarder for :func:`resample_to_mmpd`."""
+    return resample_to_mmpd(body_data, mmpd)
 
 
 class BodyDataCommonGrid:
@@ -276,7 +296,7 @@ class BodyDataCommonGrid:
         common_size = self.get_common_size()
         aligned: List[BodyData] = []
         for body_data in self._body_data_list:
-            resampled = _resample_to_mmpd(body_data, unified_mmpd)
+            resampled = resample_to_mmpd(body_data, unified_mmpd)
             array = np.full(
                 common_size,
                 _air_value(resampled.get_type()),
@@ -318,8 +338,8 @@ class MultimodalFusionComposer:
         self._fixed = aligned[0]
         self._moving = aligned[1]
         self._mask = aligned[2] if mask is not None else None
-        self._fixed_window = _display_window(self._fixed)
-        self._moving_window = _display_window(self._moving)
+        self._fixed_window = display_window(self._fixed)
+        self._moving_window = display_window(self._moving)
         self._mask_min = 0.0
         self._mask_max = 1.0
         if self._mask is not None:
@@ -367,6 +387,90 @@ class MultimodalFusionComposer:
         return np.transpose(rgb, (1, 0, 2))
 
 
+class _SliceRenderWorker:
+    """Background worker rendering fused RGB slices for the preview GUI.
+
+    The GUI thread only records the latest requested ``(axis, index)`` pair
+    together with a monotonic generation counter; the worker picks up the
+    newest request whenever it becomes free, so intermediate indices are
+    dropped automatically. Finished results are tagged with their generation
+    and index and handed back through a queue; the GUI rejects stale results
+    by comparing them against the newest request. A small LRU cache keyed by
+    ``(axis, index)`` avoids recomputing slices that were already rendered.
+    """
+
+    _CACHE_CAPACITY = 8
+
+    def __init__(
+        self,
+        composer: MultimodalFusionComposer,
+        cache_seed: Optional[tuple[tuple[str, int], np.ndarray]] = None,
+    ) -> None:
+        self._composer = composer
+        self._condition = threading.Condition()
+        self._request: Optional[tuple[str, int, int]] = None
+        self._stopped = False
+        self._results: "queue.Queue[tuple[int, str, int, np.ndarray]]" = (
+            queue.Queue()
+        )
+        self._cache: "OrderedDict[tuple[str, int], np.ndarray]" = OrderedDict()
+        if cache_seed is not None:
+            key, rgb = cache_seed
+            self._cache[key] = rgb
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request(self, axis: str, index: int, generation: int) -> None:
+        """Record the latest requested slice; older requests are dropped."""
+        with self._condition:
+            self._request = (axis, index, generation)
+            self._condition.notify()
+
+    def poll_result(self) -> Optional[tuple[int, str, int, np.ndarray]]:
+        """Return the next finished result or None when the queue is empty."""
+        try:
+            return self._results.get_nowait()
+        except queue.Empty:
+            return None
+
+    def stop(self) -> None:
+        """Stop the worker thread and wait briefly for it to finish."""
+        with self._condition:
+            self._stopped = True
+            self._condition.notify()
+        self._thread.join(timeout=2.0)
+
+    def _make_slice_cached(self, axis: str, index: int) -> np.ndarray:
+        key = (axis, index)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        rgb = self._composer.make_slice(axis, index)
+        self._cache[key] = rgb
+        while len(self._cache) > self._CACHE_CAPACITY:
+            self._cache.popitem(last=False)
+        return rgb
+
+    def _run(self) -> None:
+        last_generation = -1
+        while True:
+            with self._condition:
+                while (
+                    not self._stopped
+                    and (
+                        self._request is None
+                        or self._request[2] == last_generation
+                    )
+                ):
+                    self._condition.wait()
+                if self._stopped:
+                    return
+                axis, index, generation = self._request
+            last_generation = generation
+            rgb = self._make_slice_cached(axis, index)
+            self._results.put((generation, axis, index, rgb))
+
+
 class _ComposerGuiViewer:
     """Shared resizable preview window driven by a fusion composer.
 
@@ -385,13 +489,21 @@ class _ComposerGuiViewer:
     def gui_preview(self) -> None:
         """Open the blocking preview window.
 
+        Slices are rendered at a fixed frame rate instead of debouncing the
+        slider: the slider callback only records the latest index, a single
+        background worker thread computes the NumPy RGB slices (with a small
+        LRU cache), and the Tk main thread only converts the newest result
+        into a PhotoImage and redraws the canvas. Stale results are rejected
+        through a generation/index check, and nothing is recomputed when the
+        displayed slice has not changed.
+
         Raises:
             ImportError: When tkinter is not installed. The error message
                 includes the pip command required to install it.
         """
         from .body_data.body_data_imp._display_scale import (
             _scale_image_to_fit,
-            _upscale_for_display,
+            upscale_for_display,
         )
         from .body_data.body_data_imp._tk_gui import require_tkinter
 
@@ -401,9 +513,10 @@ class _ComposerGuiViewer:
         composer = self._composer
         _, _, s_size = composer.get_size()
 
-        def make_base_image(index):
-            rgb = composer.make_slice("s", index)
-            return _upscale_for_display(Image.fromarray(rgb, mode="RGB"))[0]
+        initial_rgb = composer.make_slice("s", 0)
+        initial_base = upscale_for_display(
+            Image.fromarray(initial_rgb, mode="RGB")
+        )[0]
 
         root = tk.Tk()
         root.title(self._title)
@@ -424,7 +537,18 @@ class _ComposerGuiViewer:
         )
         z_slider.pack(fill=tk.X, padx=8, pady=(0, 8))
 
-        state = {"photo": None, "z": 0, "base": make_base_image(0)}
+        worker = _SliceRenderWorker(
+            composer, cache_seed=(("s", 0), initial_rgb)
+        )
+
+        state = {
+            "photo": None,
+            "z": 0,  # index currently displayed
+            "target": 0,  # latest slider index
+            "generation": 0,  # bumped on every target change
+            "base": initial_base,
+            "needs_redraw": True,
+        }
 
         def redraw():
             box_width = max(1, canvas.winfo_width())
@@ -439,29 +563,50 @@ class _ComposerGuiViewer:
             )
             state["photo"] = photo # type:ignore
             z_label.configure(text=f"z = {state['z']}")
+            state["needs_redraw"] = False
 
-        pending = {"job": None}
-
-        def schedule_redraw(_event=None):
-            if pending["job"] is not None:
-                try:
-                    root.after_cancel(pending["job"])
-                except tk.TclError:
-                    pass
-            pending["job"] = root.after(30, redraw)
+        def apply_result(generation, index, rgb):
+            if generation != state["generation"] or index != state["target"]:
+                return
+            if index == state["z"]:
+                return
+            state["base"] = upscale_for_display(
+                Image.fromarray(rgb, mode="RGB")
+            )[0]
+            state["z"] = index
+            state["needs_redraw"] = True
 
         def update_slice(z_value):
-            state["z"] = int(float(z_value))
-            state["base"] = make_base_image(state["z"])
-            schedule_redraw()
+            z = int(float(z_value))
+            if z == state["target"]:
+                return
+            state["target"] = z
+            state["generation"] += 1
+            if z != state["z"]:
+                worker.request("s", z, state["generation"])
 
-        canvas.bind("<Configure>", schedule_redraw)
+        def on_configure(_event):
+            state["needs_redraw"] = True
+
+        def tick():
+            while True:
+                result = worker.poll_result()
+                if result is None:
+                    break
+                generation, _, index, rgb = result
+                apply_result(generation, index, rgb)
+            if state["needs_redraw"]:
+                redraw()
+            root.after(16, tick)
+
+        canvas.bind("<Configure>", on_configure)
         z_slider.configure(command=update_slice)
 
         base_width, base_height = state["base"].size
         root.geometry(f"{base_width}x{base_height + 100}")
-        schedule_redraw()
+        root.after(16, tick)
         root.mainloop()
+        worker.stop()
 
 
 class TwoImageFusionViewer(_ComposerGuiViewer):
@@ -498,4 +643,7 @@ __all__ = [
     "MultimodalFusionComposer",
     "TwoImageFusionViewer",
     "ThreeImageOverlayViewer",
+    "display_window",
+    "normalize_to_u8",
+    "resample_to_mmpd",
 ]

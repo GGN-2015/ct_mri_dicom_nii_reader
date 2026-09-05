@@ -28,6 +28,9 @@ from .visualization import (
     MultimodalFusionComposer,
     TwoImageFusionViewer,
     ThreeImageOverlayViewer,
+    display_window,
+    normalize_to_u8,
+    resample_to_mmpd,
 )
 
 __all__ = [
@@ -47,4 +50,7 @@ __all__ = [
     "MultimodalFusionComposer",
     "TwoImageFusionViewer",
     "ThreeImageOverlayViewer",
+    "display_window",
+    "normalize_to_u8",
+    "resample_to_mmpd",
 ]

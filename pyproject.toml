@@ -1,6 +1,6 @@
 [project]
 name = "ct-mri-dicom-nii-reader"
-version = "0.1.0"
+version = "0.1.1"
 description = "Read CT/MRI DICOM series and NIfTI volumes into isotropic LPS-ordered NumPy arrays"
 authors = [
     {name = "GGN_2015",email = "neko@jlulug.org"}

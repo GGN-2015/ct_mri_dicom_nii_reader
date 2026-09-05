@@ -309,7 +309,7 @@ Both are blocking (they open a Tk main loop) and use
 wrappers.
 
 The windows open at the default upscaled size produced by
-`_upscale_for_display` (smallest image side at least 512 px). Resizing the
+`upscale_for_display` (smallest image side at least 512 px). Resizing the
 window rescales the image together with it while keeping its original
 aspect ratio.
 
@@ -390,6 +390,31 @@ Both viewer windows behave like the grayscale previews: they open at the
 default upscaled size, rescale with the window while preserving the aspect
 ratio, and raise an `ImportError` with the tkinter installation command
 when tkinter is missing.
+
+While the slider is dragged, the viewer renders at a fixed frame rate
+instead of debouncing: the slider callback only records the latest slice
+index, a single background worker thread computes the NumPy RGB slices
+(dropping intermediate indices automatically), and the Tk main thread only
+converts the newest result into a `PhotoImage` and redraws the canvas.
+Stale worker results are rejected through a generation/index check, and
+already rendered slices are reused from a small `(axis, index)` LRU cache.
+
+### Public display helpers
+
+The formerly private display helpers are now available under public names;
+the old names remain as compatibility forwarders for the regknee project:
+
+| Public function | Compatibility forwarder | Description |
+| --- | --- | --- |
+| `display_window(body_data)` | `_display_window` | Bounded display window for fusion rendering |
+| `normalize_to_u8(values, window)` | `_normalize_to_u8` | Window/normalize values to `uint8` |
+| `resample_to_mmpd(body_data, mmpd)` | `_resample_to_mmpd` | Resample a volume to a unified voxel spacing |
+| `upscale_for_display(image)` | `_upscale_for_display` | Nearest-neighbor upscale (smallest side 512 px) |
+
+```python
+from ct_mri_dicom_nii_reader import display_window, normalize_to_u8, resample_to_mmpd
+from ct_mri_dicom_nii_reader.body_data.body_data_imp._display_scale import upscale_for_display
+```
 
 ## Requirements
 

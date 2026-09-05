@@ -8,7 +8,7 @@ from PIL import Image
 _MIN_DISPLAY_SIDE = 512
 
 
-def _upscale_for_display(image: Image.Image) -> tuple[Image.Image, float, float]:
+def upscale_for_display(image: Image.Image) -> tuple[Image.Image, float, float]:
     """Return a nearest-neighbor image whose dimensions are at least 512 px.
 
     This is the default size used when a preview window opens. Interactive
@@ -28,6 +28,13 @@ def _upscale_for_display(image: Image.Image) -> tuple[Image.Image, float, float]
         (display_width, display_height), Image.Resampling.NEAREST
     )
     return displayed, display_width / width, display_height / height
+
+
+def _upscale_for_display(
+    image: Image.Image,
+) -> tuple[Image.Image, float, float]:
+    """Compatibility forwarder for :func:`upscale_for_display`."""
+    return upscale_for_display(image)
 
 
 def _scale_image_to_fit(
