@@ -127,20 +127,104 @@ def _compose_multimodal_fusion(
     """Compose the reference amber/cyan edge fusion as an RGB image."""
     fixed_u8 = normalize_to_u8(fixed, fixed_window)
     moving_u8 = normalize_to_u8(moving, moving_window)
+    return _compose_edge_fusion_u8(fixed_u8, moving_u8)
+
+
+def _compose_edge_fusion_u8(
+    fixed_u8: np.ndarray,
+    moving_u8: np.ndarray,
+    fixed_edge: Optional[np.ndarray] = None,
+    moving_edge: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Compose the original fusion from independently normalized inputs."""
     fixed_rgb = np.repeat(fixed_u8[:, :, None], 3, axis=2).astype(np.float32)
+    if fixed_edge is None:
+        fixed_edge = _edge_strength(fixed_u8)
+    if moving_edge is None:
+        moving_edge = _edge_strength(moving_u8)
 
     fusion = fixed_rgb * 0.32
     fusion += (
-        _edge_strength(fixed_u8)[:, :, None]
+        fixed_edge[:, :, None]
         * _FIXED_EDGE_COLOR
     )
     fusion += (
-        _edge_strength(moving_u8)[:, :, None]
+        moving_edge[:, :, None]
         * _EDGE_FUSION_OPACITY
         * _MOVING_EDGE_COLOR
     )
     return np.ascontiguousarray(
         np.clip(fusion, 0.0, 255.0), dtype=np.uint8
+    )
+
+
+def _compose_two_image_layers_u8(
+    fixed_u8: np.ndarray,
+    moving_u8: np.ndarray,
+    show_fixed: bool,
+    show_moving: bool,
+    show_boundary: bool,
+    fixed_edge: Optional[np.ndarray] = None,
+    moving_edge: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Compose one of the eight layer selections in the two-image viewer."""
+    if not show_fixed and not show_moving:
+        return np.zeros((*fixed_u8.shape, 3), dtype=np.uint8)
+
+    if show_fixed and show_moving:
+        if show_boundary:
+            return _compose_edge_fusion_u8(
+                fixed_u8, moving_u8, fixed_edge, moving_edge
+            )
+
+        fixed_color = (
+            fixed_u8[:, :, None].astype(np.float32)
+            * (_FIXED_EDGE_COLOR / 255.0)
+        )
+        moving_color = (
+            moving_u8[:, :, None].astype(np.float32)
+            * (_MOVING_EDGE_COLOR / 255.0)
+        )
+        return np.ascontiguousarray(
+            np.clip(fixed_color + moving_color, 0.0, 255.0),
+            dtype=np.uint8,
+        )
+
+    grayscale = fixed_u8 if show_fixed else moving_u8
+    rgb = np.repeat(grayscale[:, :, None], 3, axis=2)
+    if not show_boundary:
+        return np.ascontiguousarray(rgb)
+
+    edge = fixed_edge if show_fixed else moving_edge
+    if edge is None:
+        edge = _edge_strength(grayscale)
+    brightened = (
+        rgb.astype(np.float32)
+        + edge[:, :, None] * (255.0 * _EDGE_FUSION_OPACITY)
+    )
+    return np.ascontiguousarray(
+        np.clip(brightened, 0.0, 255.0), dtype=np.uint8
+    )
+
+
+def _compose_two_image_layers(
+    fixed: np.ndarray,
+    moving: np.ndarray,
+    fixed_window: tuple[float, float],
+    moving_window: tuple[float, float],
+    show_fixed: bool,
+    show_moving: bool,
+    show_boundary: bool,
+) -> np.ndarray:
+    """Normalize both modalities independently and compose selected layers."""
+    fixed_u8 = normalize_to_u8(fixed, fixed_window)
+    moving_u8 = normalize_to_u8(moving, moving_window)
+    return _compose_two_image_layers_u8(
+        fixed_u8,
+        moving_u8,
+        show_fixed,
+        show_moving,
+        show_boundary,
     )
 
 
@@ -395,35 +479,56 @@ class _SliceRenderWorker:
     newest request whenever it becomes free, so intermediate indices are
     dropped automatically. Finished results are tagged with their generation
     and index and handed back through a queue; the GUI rejects stale results
-    by comparing them against the newest request. A small LRU cache keyed by
-    ``(axis, index)`` avoids recomputing slices that were already rendered.
+    by comparing them against the newest request. Bounded LRU caches retain
+    normalized components, edges, and completed layer combinations.
     """
 
-    _CACHE_CAPACITY = 8
+    _CACHE_CAPACITY = 24
+    _COMPONENT_CACHE_CAPACITY = 8
 
     def __init__(
         self,
         composer: MultimodalFusionComposer,
-        cache_seed: Optional[tuple[tuple[str, int], np.ndarray]] = None,
+        cache_seed: Optional[
+            tuple[
+                tuple[str, int, Optional[tuple[bool, bool, bool]]],
+                np.ndarray,
+            ]
+        ] = None,
     ) -> None:
         self._composer = composer
         self._condition = threading.Condition()
-        self._request: Optional[tuple[str, int, int]] = None
+        self._request: Optional[
+            tuple[
+                str,
+                int,
+                int,
+                Optional[tuple[bool, bool, bool]],
+            ]
+        ] = None
         self._stopped = False
         self._results: "queue.Queue[tuple[int, str, int, np.ndarray]]" = (
             queue.Queue()
         )
-        self._cache: "OrderedDict[tuple[str, int], np.ndarray]" = OrderedDict()
+        self._cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self._normalized_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._edge_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         if cache_seed is not None:
             key, rgb = cache_seed
             self._cache[key] = rgb
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def request(self, axis: str, index: int, generation: int) -> None:
+    def request(
+        self,
+        axis: str,
+        index: int,
+        generation: int,
+        layers: Optional[tuple[bool, bool, bool]] = None,
+    ) -> None:
         """Record the latest requested slice; older requests are dropped."""
         with self._condition:
-            self._request = (axis, index, generation)
+            self._request = (axis, index, generation, layers)
             self._condition.notify()
 
     def poll_result(self) -> Optional[tuple[int, str, int, np.ndarray]]:
@@ -440,15 +545,98 @@ class _SliceRenderWorker:
             self._condition.notify()
         self._thread.join(timeout=2.0)
 
-    def _make_slice_cached(self, axis: str, index: int) -> np.ndarray:
+    @staticmethod
+    def _trim_cache(cache: OrderedDict, capacity: int) -> None:
+        while len(cache) > capacity:
+            cache.popitem(last=False)
+
+    def _normalized_slices(
+        self, axis: str, index: int
+    ) -> tuple[np.ndarray, np.ndarray]:
         key = (axis, index)
+        if key in self._normalized_cache:
+            self._normalized_cache.move_to_end(key)
+            return self._normalized_cache[key]
+
+        composer = self._composer
+        fixed = _take_slice(
+            np.asarray(composer._fixed._body_data), axis, index
+        )
+        moving = _take_slice(
+            np.asarray(composer._moving._body_data), axis, index
+        )
+        normalized = (
+            normalize_to_u8(fixed, composer._fixed_window),
+            normalize_to_u8(moving, composer._moving_window),
+        )
+        self._normalized_cache[key] = normalized
+        self._trim_cache(
+            self._normalized_cache, self._COMPONENT_CACHE_CAPACITY
+        )
+        return normalized
+
+    def _edge(
+        self, axis: str, index: int, image_number: int, image: np.ndarray
+    ) -> np.ndarray:
+        key = (axis, index, image_number)
+        if key in self._edge_cache:
+            self._edge_cache.move_to_end(key)
+            return self._edge_cache[key]
+        edge = _edge_strength(image)
+        self._edge_cache[key] = edge
+        self._trim_cache(
+            self._edge_cache, self._COMPONENT_CACHE_CAPACITY * 2
+        )
+        return edge
+
+    def _make_two_image_slice(
+        self,
+        axis: str,
+        index: int,
+        layers: tuple[bool, bool, bool],
+    ) -> np.ndarray:
+        show_fixed, show_moving, show_boundary = layers
+        if not show_fixed and not show_moving:
+            fixed = _take_slice(
+                np.asarray(self._composer._fixed._body_data), axis, index
+            )
+            black = np.zeros((*fixed.shape, 3), dtype=np.uint8)
+            return np.transpose(black, (1, 0, 2))
+
+        fixed_u8, moving_u8 = self._normalized_slices(axis, index)
+        fixed_edge = None
+        moving_edge = None
+        if show_boundary and show_fixed:
+            fixed_edge = self._edge(axis, index, 1, fixed_u8)
+        if show_boundary and show_moving:
+            moving_edge = self._edge(axis, index, 2, moving_u8)
+        rgb = _compose_two_image_layers_u8(
+            fixed_u8,
+            moving_u8,
+            show_fixed,
+            show_moving,
+            show_boundary,
+            fixed_edge,
+            moving_edge,
+        )
+        return np.transpose(rgb, (1, 0, 2))
+
+    def _make_slice_cached(
+        self,
+        axis: str,
+        index: int,
+        layers: Optional[tuple[bool, bool, bool]],
+    ) -> np.ndarray:
+        key = (axis, index, layers)
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
-        rgb = self._composer.make_slice(axis, index)
+        if layers is None:
+            rgb = self._composer.make_slice(axis, index)
+        else:
+            rgb = self._make_two_image_slice(axis, index, layers)
         self._cache[key] = rgb
-        while len(self._cache) > self._CACHE_CAPACITY:
-            self._cache.popitem(last=False)
+        self._trim_cache(self._cache, self._CACHE_CAPACITY)
         return rgb
 
     def _run(self) -> None:
@@ -465,9 +653,9 @@ class _SliceRenderWorker:
                     self._condition.wait()
                 if self._stopped:
                     return
-                axis, index, generation = self._request
+                axis, index, generation, layers = self._request
             last_generation = generation
-            rgb = self._make_slice_cached(axis, index)
+            rgb = self._make_slice_cached(axis, index, layers)
             self._results.put((generation, axis, index, rgb))
 
 
@@ -524,6 +712,28 @@ class _ComposerGuiViewer:
         canvas = tk.Canvas(root, highlightthickness=0, borderwidth=0)
         canvas.pack(fill=tk.BOTH, expand=True)
 
+        is_two_image_viewer = composer.get_mask() is None
+        layer_vars = None
+        layer_buttons = []
+        initial_layers = None
+        if is_two_image_viewer:
+            controls = tk.Frame(root)
+            controls.pack(fill=tk.X, padx=8, pady=(6, 0))
+            layer_vars = (
+                tk.BooleanVar(master=root, value=True),
+                tk.BooleanVar(master=root, value=True),
+                tk.BooleanVar(master=root, value=True),
+            )
+            for label, variable in zip(
+                ("Image 1", "Image 2", "Boundary"), layer_vars
+            ):
+                button = tk.Checkbutton(
+                    controls, text=label, variable=variable
+                )
+                button.pack(side=tk.LEFT, padx=(0, 12))
+                layer_buttons.append(button)
+            initial_layers = (True, True, True)
+
         z_label = tk.Label(root)
         z_label.pack(pady=(6, 0))
 
@@ -538,7 +748,8 @@ class _ComposerGuiViewer:
         z_slider.pack(fill=tk.X, padx=8, pady=(0, 8))
 
         worker = _SliceRenderWorker(
-            composer, cache_seed=(("s", 0), initial_rgb)
+            composer,
+            cache_seed=(("s", 0, initial_layers), initial_rgb),
         )
 
         state = {
@@ -546,6 +757,7 @@ class _ComposerGuiViewer:
             "z": 0,  # index currently displayed
             "target": 0,  # latest slider index
             "generation": 0,  # bumped on every target change
+            "layers": initial_layers,
             "base": initial_base,
             "needs_redraw": True,
         }
@@ -568,8 +780,6 @@ class _ComposerGuiViewer:
         def apply_result(generation, index, rgb):
             if generation != state["generation"] or index != state["target"]:
                 return
-            if index == state["z"]:
-                return
             state["base"] = upscale_for_display(
                 Image.fromarray(rgb, mode="RGB")
             )[0]
@@ -583,7 +793,27 @@ class _ComposerGuiViewer:
             state["target"] = z
             state["generation"] += 1
             if z != state["z"]:
-                worker.request("s", z, state["generation"])
+                worker.request(
+                    "s", z, state["generation"], state["layers"]
+                )
+
+        def update_layers():
+            assert layer_vars is not None
+            layers = (
+                bool(layer_vars[0].get()),
+                bool(layer_vars[1].get()),
+                bool(layer_vars[2].get()),
+            )
+            if layers == state["layers"]:
+                return
+            state["layers"] = layers
+            state["generation"] += 1
+            worker.request(
+                "s",
+                state["target"],
+                state["generation"],
+                layers,
+            )
 
         def on_configure(_event):
             state["needs_redraw"] = True
@@ -601,9 +831,12 @@ class _ComposerGuiViewer:
 
         canvas.bind("<Configure>", on_configure)
         z_slider.configure(command=update_slice)
+        for button in layer_buttons:
+            button.configure(command=update_layers)
 
         base_width, base_height = state["base"].size
-        root.geometry(f"{base_width}x{base_height + 100}")
+        controls_height = 132 if is_two_image_viewer else 100
+        root.geometry(f"{base_width}x{base_height + controls_height}")
         root.after(16, tick)
         root.mainloop()
         worker.stop()

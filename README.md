@@ -345,6 +345,13 @@ amber/cyan edge fusion: the fixed volume contributes a dimmed grayscale
 background with amber edges, the moving volume contributes cyan edges, and
 where both edges overlap the colors add up to white.
 
+Its preview window has independent `Image 1`, `Image 2`, and `Boundary`
+checkboxes, all enabled by default. A single selected image is displayed as
+true RGB grayscale, optionally brightened at its boundaries. Two selected
+images are independently normalized to 0-255 and shown as an amber/cyan
+fusion. With neither image selected the canvas is black, including when only
+`Boundary` is enabled. These controls are exclusive to the two-image viewer.
+
 ```python
 from ct_mri_dicom_nii_reader import TwoImageFusionViewer
 
@@ -397,7 +404,8 @@ index, a single background worker thread computes the NumPy RGB slices
 (dropping intermediate indices automatically), and the Tk main thread only
 converts the newest result into a `PhotoImage` and redraws the canvas.
 Stale worker results are rejected through a generation/index check, and
-already rendered slices are reused from a small `(axis, index)` LRU cache.
+normalized slices, boundaries, and completed layer combinations are reused
+from bounded LRU caches.
 
 ### Public display helpers
 
