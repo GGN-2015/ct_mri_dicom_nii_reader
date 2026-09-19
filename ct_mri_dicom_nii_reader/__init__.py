@@ -1,4 +1,4 @@
-"""Medical image (CT / MRI / mask) reading and writing utilities.
+"""Medical image (CT / CBCT / MRI / mask) reading and writing utilities.
 
 This package loads CT DICOM series and NIfTI volumes into isotropic NumPy
 volumes with ``(L, P, S)`` axis order, wraps them in the :class:`BodyData`

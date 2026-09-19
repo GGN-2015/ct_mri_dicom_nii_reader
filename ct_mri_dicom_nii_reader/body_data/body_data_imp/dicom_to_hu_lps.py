@@ -13,6 +13,84 @@ import SimpleITK as sitk
 
 Metadata: TypeAlias = dict[str, object]
 
+_CLASSIFICATION_TAGS = {
+    "image_type": "0008|0008",
+    "manufacturer": "0008|0070",
+    "station_name": "0008|1010",
+    "series_description": "0008|103e",
+    "manufacturer_model_name": "0008|1090",
+    "scan_options": "0018|0022",
+    "protocol_name": "0018|1030",
+    "acquisition_type": "0018|9302",
+    "table_feed_per_rotation": "0018|9310",
+    "spiral_pitch_factor": "0018|9311",
+}
+
+
+def _normalized_identifier(value: object) -> str:
+    return "".join(character for character in str(value).upper() if character.isalnum())
+
+
+def _infer_dicom_modality(
+    dicom_modality: str,
+    attributes: dict[str, str],
+) -> tuple[str, str, str]:
+    """Classify CT-derived CBCT only when the headers contain strong evidence."""
+    modality = dicom_modality.strip().upper() or "UNKNOWN"
+    if modality == "CBCT":
+        return "CBCT", "dicom:modality", "explicit"
+    if modality != "CT":
+        confidence = "explicit" if modality != "UNKNOWN" else "unknown"
+        return modality, "dicom:modality", confidence
+
+    explicit_markers = (
+        "CBCT",
+        "CONEBEAM",
+        "3DCARM",
+        "OARM",
+        "CIOSSPIN",
+        "DYNACT",
+        "XPERCT",
+        "\u9525\u5f62\u675f",
+    )
+    descriptive_fields = (
+        "manufacturer_model_name",
+        "station_name",
+        "series_description",
+        "protocol_name",
+        "scan_options",
+        "image_type",
+    )
+    normalized_fields = {
+        field: _normalized_identifier(attributes.get(field, ""))
+        for field in descriptive_fields
+    }
+    for field, value in normalized_fields.items():
+        if any(marker in value for marker in explicit_markers):
+            return "CBCT", f"dicom:{field}", "explicit"
+
+    device_text = "".join(
+        normalized_fields[field]
+        for field in ("manufacturer_model_name", "station_name")
+    )
+    image_type = normalized_fields["image_type"]
+    if "CARM" in device_text and (
+        "3D" in device_text or "3DSLICE" in image_type
+    ):
+        return "CBCT", "dicom:3d_carm_reconstruction", "inferred"
+
+    acquisition_type = _normalized_identifier(
+        attributes.get("acquisition_type", "")
+    )
+    if (
+        acquisition_type == "SPIRAL"
+        or attributes.get("spiral_pitch_factor", "").strip()
+        or attributes.get("table_feed_per_rotation", "").strip()
+    ):
+        return "CT", "dicom:spiral_acquisition", "explicit"
+
+    return "CT", "dicom:modality_default", "inferred"
+
 
 @dataclass(frozen=True)
 class _SeriesInfo:
@@ -88,7 +166,10 @@ def _choose_series(dicom_dir: Path, series_uid: str | None) -> _SeriesInfo:
     return min(tied, key=lambda info: info.uid)
 
 
-def _read_ct_series(info: _SeriesInfo, require_ct: bool) -> tuple[sitk.Image, str]:
+def _read_ct_series(
+    info: _SeriesInfo,
+    require_ct: bool,
+) -> tuple[sitk.Image, str, dict[str, str]]:
     # Enhanced multi-frame DICOM is already 3-D and should not gain a fourth
     # dimension by being passed through ImageSeriesReader.
     if len(info.file_names) == 1 and info.single_file_dimension == 3:
@@ -112,19 +193,24 @@ def _read_ct_series(info: _SeriesInfo, require_ct: bool) -> tuple[sitk.Image, st
     if image.GetDimension() != 3:
         raise ValueError(f"Expected a 3-D DICOM series, got {image.GetDimension()} dimensions")
 
+    attributes = {
+        name: metadata_get(tag).strip() if metadata_has(tag) else ""
+        for name, tag in _CLASSIFICATION_TAGS.items()
+    }
     modality = ""
     modality_tag = "0008|0060"
     if metadata_has(modality_tag):
         modality = metadata_get(modality_tag).strip().upper()
-    if require_ct and modality != "CT":
+    if require_ct and modality not in {"CT", "CBCT"}:
         shown = modality or "missing"
         raise ValueError(
-            f"The selected series has Modality={shown!r}, not 'CT'; HU is a CT concept. "
+            f"The selected series has Modality={shown!r}, not CT/CBCT; "
+            "HU is a CT concept. "
             "Pass require_ct=False only if the stored/rescaled values are meaningful "
             "for your modality."
         )
 
-    return image, modality
+    return image, modality, attributes
 
 
 def _image_support_bounds_lps(image: sitk.Image) -> tuple[np.ndarray, np.ndarray]:
@@ -232,8 +318,11 @@ def load_dicom_hu_lps(
     mmpd = float(mmpd)
 
     selected_series = _choose_series(directory, series_uid)
-    source_image, modality = _read_ct_series(
+    source_image, dicom_modality, dicom_attributes = _read_ct_series(
         selected_series, require_ct=require_ct
+    )
+    modality, modality_source, modality_confidence = _infer_dicom_modality(
+        dicom_modality, dicom_attributes
     )
     output_image = _resample_to_isotropic_lps(
         source_image,
@@ -259,6 +348,10 @@ def load_dicom_hu_lps(
         "series_depth": selected_series.depth,
         "series_voxel_count": selected_series.voxel_count,
         "modality": modality,
+        "dicom_modality": dicom_modality or "UNKNOWN",
+        "modality_source": modality_source,
+        "modality_confidence": modality_confidence,
+        "dicom_attributes": dicom_attributes,
         "number_of_files": len(selected_series.file_names),
         "source_size_xyz": tuple(int(value) for value in source_image.GetSize()),
         "source_spacing_xyz_mm": tuple(

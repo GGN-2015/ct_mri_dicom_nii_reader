@@ -5,7 +5,7 @@ The rendering approach mirrors the visualization of the regknee project:
 * :class:`BodyDataCommonGrid` aligns any number of volumes at the LPS origin,
   resamples them onto the finest unified voxel spacing and places them into
   one common NumPy grid. Blank regions are filled with the modality-specific
-  air value (-1024 for CT, 0 for MRI and masks).
+  air value (-1024 for CT/CBCT, 0 for MRI and masks).
 * :class:`MultimodalFusionComposer` renders two aligned volumes per slice
   using the reference amber/cyan edge fusion (where both edges overlap the
   colors add up to white), with an optional semi-transparent red mask overlay
@@ -38,7 +38,7 @@ _MASK_OVERLAY_MAX_ALPHA = 0.5
 
 
 def _air_value(image_type: Optional[str]) -> float:
-    return -1024.0 if image_type == "ct" else 0.0
+    return -1024.0 if image_type in {"ct", "cbct"} else 0.0
 
 
 def display_window(body_data: BodyData) -> tuple[float, float]:
@@ -61,7 +61,7 @@ def display_window(body_data: BodyData) -> tuple[float, float]:
         high = min(1.0, float(np.percentile(sample, 99.5)))
         if high <= low + 1e-6:
             return 0.0, 1.0
-    elif body_data.get_type() == "ct":
+    elif body_data.get_type() in {"ct", "cbct"}:
         low = max(-250.0, float(np.percentile(sample, 1.0)))
         high = max(350.0, float(np.percentile(sample, 99.5)))
     else:

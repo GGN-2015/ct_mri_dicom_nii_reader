@@ -1,7 +1,7 @@
 # ct_mri_dicom_nii_reader
 
 A small, dependency-light Python library for reading medical image volumes
-(CT / MRI / masks) from **DICOM series** and **NIfTI** files into isotropic,
+(CT / CBCT / MRI / masks) from **DICOM series** and **NIfTI** files into isotropic,
 LPS-ordered NumPy arrays, plus a compact container class with slice access,
 processing helpers and optional Tkinter/Pillow preview GUIs.
 
@@ -85,7 +85,7 @@ ct_again = manager.load_file("out/ct_volume.ubd.npz")
 ```python
 from ct_mri_dicom_nii_reader import BodyData, RoiRect
 
-print(ct.get_type())        # 'ct' | 'mri' | 'mask'  (or None if uninitialized)
+print(ct.get_type())        # 'ct' | 'cbct' | 'mri' | 'mask' (or None)
 print(ct.get_size())        # (n_L, n_P, n_S)
 print(ct.get_mmpd())        # mm per dot (voxel width)
 print(ct.get_pos(0, 0, 0))  # value at voxel [l, p, s]
@@ -134,7 +134,8 @@ If omitted it defaults to `1.0` mm.
 
 | Type | Meaning |
 | --- | --- |
-| `"ct"` | CT / DX / CR / CBCT volumes (HU) |
+| `"ct"` | conventional CT / DX / CR volumes (HU) |
+| `"cbct"` | cone-beam CT volumes identified from DICOM acquisition metadata |
 | `"mri"` | MR volumes |
 | `"mask"` | segmentation labels or unknown modality |
 
@@ -163,7 +164,7 @@ post-processes masks.
 
 | Class | Handles |
 | --- | --- |
-| `DicomBodyDataLoader` | `*.dcm` (loads the folder containing the file) |
+| `DicomBodyDataLoader` | `*.dcm`, extensionless series, or files with a DICOM preamble |
 | `NiiBodyDataLoader` | `*.nii`, `*.nii.gz` |
 | `UnifiedBodyDataLoader` | `*.ubd.npz` |
 
@@ -176,7 +177,7 @@ All loaders accept `get_mmpd()` / `set_mmpd()` for the output voxel width.
 | `from_array(data, image_type, mmpd)` | Wrap a NumPy array in LPS order |
 | `to_numpy(copy=False)` | Return the internal 3-D NumPy array (copy only when `copy=True`) |
 | `get_initialized()` | Whether `image_type` has been set |
-| `get_type()` | `"ct"`, `"mri"`, `"mask"` or `None` |
+| `get_type()` | `"ct"`, `"cbct"`, `"mri"`, `"mask"` or `None` |
 | `unify_to_mask()` | Binarize values to `int8` at threshold 0.5 |
 | `get_size()` | `(n_L, n_P, n_S)` |
 | `get_pos(l, p, s)` | Value at a voxel |
@@ -214,7 +215,7 @@ Accessors: `get_xmin()`, `get_xmax()`, `get_ymin()`, `get_ymax()`.
 | `NoAvailableDataLoader(filepath)` | No loader matches the file extension |
 | `DataLoaderNotMatch` | A loader's `load_file` is called on a non-matching path |
 | `BodyDataNotInitialized` | An operation requires an initialized `BodyData` |
-| `BodyDataTypeError(image_type)` | The image type is not `ct` / `mri` / `mask` |
+| `BodyDataTypeError(image_type)` | The image type is not `ct` / `cbct` / `mri` / `mask` |
 
 ## Low-level loading functions
 
@@ -244,8 +245,10 @@ volume, metadata = load_nifti_lps(
 ```
 
 DICOM metadata keys include `series_uid`, `series_depth`,
-`series_voxel_count`, `modality`, `number_of_files`, and the source
-geometry (`source_size_xyz`, `source_spacing_xyz_mm`,
+`series_voxel_count`, inferred `modality`, raw `dicom_modality`,
+`modality_source`, `modality_confidence`, `dicom_attributes`,
+`number_of_files`, and the source geometry (`source_size_xyz`,
+`source_spacing_xyz_mm`,
 `source_origin_lps_mm`, `source_direction_xyz_to_lps`).
 
 NIfTI metadata keys include `modality` (`"CT"`, `"MR"` or `"UNKNOWN"`),
@@ -265,8 +268,13 @@ When `series_uid` is not given, `load_dicom_hu_lps`:
 4. breaks ties deterministically by lexicographically smallest UID.
 
 The loader class `DicomBodyDataLoader` relaxes `require_ct` to `False` and
-maps DICOM Modality to image type: CT/DX/CR/CBCT -> `"ct"`, MR -> `"mri"`,
-everything else -> `"mask"`.
+maps inferred CBCT -> `"cbct"`, CT/DX/CR -> `"ct"`, MR -> `"mri"`, and
+everything else -> `"mask"`. CBCT inference is conservative: explicit header
+signals such as `CBCT`, `CONE BEAM`, `3D C-arm`, `O-arm`, or a supported device
+identifier are required. Geometry and image appearance alone do not trigger it.
+When no CBCT marker or explicit spiral-acquisition parameter is available, a
+raw DICOM `Modality=CT` remains `"ct"` with inferred rather than explicit
+confidence.
 
 ### NIfTI modality detection order
 
@@ -363,7 +371,7 @@ If the two volumes differ in size or voxel spacing, they are first aligned
 at the LPS origin, resampled onto the finest unified spacing (the smallest
 `mmpd`), and placed into one common NumPy array whose per-axis lengths are
 the maxima of the resampled volumes. Regions covered by no volume hold the
-modality-specific air value (-1024 for CT, 0 for MRI and masks). The same
+modality-specific air value (-1024 for CT/CBCT, 0 for MRI and masks). The same
 combination is available programmatically:
 
 ```python

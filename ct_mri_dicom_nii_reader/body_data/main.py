@@ -98,7 +98,25 @@ class DicomBodyDataLoader(BodyDataLoader):
         BodyDataLoader.__init__(self)
 
     def check_match(self, filepath:str) -> bool:
-        return filepath.lower().endswith(".dcm")
+        if filepath.lower().endswith(".dcm"):
+            return True
+
+        path = Path(filepath)
+        if not path.is_file():
+            return False
+        if path.suffix:
+            try:
+                with path.open("rb") as dicom_file:
+                    dicom_file.seek(128)
+                    return dicom_file.read(4) == b"DICM"
+            except OSError:
+                return False
+
+        extensionless_file_count = sum(
+            entry.is_file() and not entry.suffix
+            for entry in path.parent.iterdir()
+        )
+        return extensionless_file_count >= 10
 
     # 这里我们一般假设 filepath 是一个 .dcm 文件
     # 而且这个 .dcm 同文件夹中的所有 .dcm 文件只有一个 DICOM 序列
@@ -110,7 +128,9 @@ class DicomBodyDataLoader(BodyDataLoader):
             require_ct=False,
             return_metadata=True)
         modality = str(metadata["modality"]).lower()
-        if modality in ["ct", "dx", "cr", "cbct"]:
+        if modality == "cbct":
+            image_type = "cbct"
+        elif modality in ["ct", "dx", "cr"]:
             image_type = "ct"
         elif modality in ["mr"]:
             image_type = "mri"
@@ -357,7 +377,7 @@ class BodyData:
         if self._image_type is None:
             raise BodyDataNotInitialized()
         match self._image_type:
-            case "ct":
+            case "ct" | "cbct":
                 return -1024
             case "mri":
                 return 0
