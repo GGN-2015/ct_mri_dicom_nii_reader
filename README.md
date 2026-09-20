@@ -39,6 +39,9 @@ programming interface.
   RGB rendering), `TwoImageFusionViewer` (amber/cyan edge fusion of two
   volumes) and `ThreeImageOverlayViewer` (fusion + semi-transparent red
   mask overlay).
+- **Reusable bone segmentation**: public CT/CBCT functions provide adaptive
+  dual thresholds, 3-D hysteresis reconstruction, cortical gap repair and
+  physical-volume filtering independently of the GUI.
 
 ## Installation
 
@@ -92,8 +95,10 @@ print(ct.get_pos(0, 0, 0))  # value at voxel [l, p, s]
 
 slice_l = ct.get_slice_l(100)      # BodyDataSlice view of a plane
 slice_s = ct.get_slice_s(50)
+ps, sl, lp = ct.getProjectSlices() # max projections in PS, SL, LP order
 slice_s.gui_preview()              # blocking 2-D preview window
 ct.gui_preview()                   # blocking 3-D preview window with z slider
+ct.guiCompare(other)               # blocking 2x3 projection comparison
 
 print(ct.percentile(1), ct.percentile(99))   # intensity percentiles
 clone = ct.clone()                  # deep copy of the volume
@@ -116,6 +121,25 @@ All loaded volumes use the patient **LPS** convention:
 
 DICOM rescaling (Rescale Slope / Intercept) is applied by
 SimpleITK/GDCM while reading, so CT values are Hounsfield units.
+
+### Maximum projections
+
+`BodyData.getProjectSlices()` returns three `BodyDataSlice` objects in
+`(PS, SL, LP)` order. Each image is reduced with `max` along the omitted LPS
+dimension. The corresponding NumPy shapes are `(P, S)`, `(S, L)`, and
+`(L, P)`.
+
+The array-level calculation is also public and reusable without `BodyData`:
+
+```python
+from ct_mri_dicom_nii_reader import (
+    get_lps_max_projections,
+    max_intensity_projection,
+)
+
+ps_array, sl_array, lp_array = get_lps_max_projections(volume_lps)
+single_ps_array = max_intensity_projection(volume_lps, "ps")
+```
 
 ### `mmpd` (mm per dot)
 
@@ -141,6 +165,47 @@ If omitted it defaults to `1.0` mm.
 
 Masks whose values already lie in `[0, 1]` are automatically binarized to
 `int8` (`0` / `1`) on load.
+
+### Bone segmentation
+
+The GUI and downstream applications use the same public segmentation API:
+
+```python
+from ct_mri_dicom_nii_reader import (
+    apply_bone_mask,
+    estimate_bone_thresholds,
+    extract_bone_mask,
+    extract_cbct_bone_mask,
+    extract_ct_bone_mask,
+)
+
+volume = ct.to_numpy()
+low, high = estimate_bone_thresholds(volume, "ct")
+mask = extract_ct_bone_mask(volume, mmpd=ct.get_mmpd())
+bone_only = apply_bone_mask(volume, mask, outside_value=0)
+
+# The generic function accepts CT or CBCT and optional threshold overrides.
+custom_mask = extract_bone_mask(
+    volume,
+    "ct",
+    mmpd=ct.get_mmpd(),
+    low_threshold=100.0,
+    high_threshold=300.0,
+    denoise_sigma_mm=0.4,
+    closing_radius_mm=1.0,
+    minimum_component_volume_mm3=8.0,
+)
+
+cbct_mask = extract_cbct_bone_mask(cbct_array, mmpd=cbct_mmpd)
+```
+
+CT defaults to a 100 HU candidate threshold and a 300 HU high-confidence
+seed threshold. CBCT estimates both thresholds from a robust three-class
+histogram of each volume, so it does not assume that pseudo-HU values are
+portable between scanners. Lower-threshold voxels are retained only when
+3-D-connected to high-confidence bone. A small closing operation repairs
+narrow cortical gaps, and isolated components below a physical volume are
+removed. All mask extraction is completed before a preview window opens.
 
 ## API reference
 
@@ -169,6 +234,9 @@ post-processes masks.
 | `UnifiedBodyDataLoader` | `*.ubd.npz` |
 
 All loaders accept `get_mmpd()` / `set_mmpd()` for the output voxel width.
+`DicomBodyDataLoader` additionally accepts `get_series_uid()` /
+`set_series_uid(uid)`. The manager exposes the same selection as
+`load_file(filepath, mmpd=None, series_uid=None)`.
 
 ### `BodyData`
 
@@ -182,6 +250,8 @@ All loaders accept `get_mmpd()` / `set_mmpd()` for the output voxel width.
 | `get_size()` | `(n_L, n_P, n_S)` |
 | `get_pos(l, p, s)` | Value at a voxel |
 | `get_slice_l(l)` / `get_slice_p(p)` / `get_slice_s(s)` | Plane views (`BodyDataSlice`) |
+| `getProjectSlices()` | Maximum projections as a `(PS, SL, LP)` tuple of `BodyDataSlice` objects |
+| `guiCompare(rhs)` | Blocking 2x3 comparison on the larger shared `mmpd`, with one display scale for all PS, SL and LP projections |
 | `get_mmpd()` / `set_mmpd(mmpd)` | Voxel width accessors |
 | `percentile(idx)` | `idx` in `[0, 100]` across all voxels |
 | `clone()` | Deep copy |
@@ -223,7 +293,10 @@ For full control, the implementation functions can be used directly
 (they are also what the loader classes call internally):
 
 ```python
-from ct_mri_dicom_nii_reader.body_data.body_data_imp.dicom_to_hu_lps import load_dicom_hu_lps
+from ct_mri_dicom_nii_reader.body_data.body_data_imp.dicom_to_hu_lps import (
+    list_dicom_series,
+    load_dicom_hu_lps,
+)
 from ct_mri_dicom_nii_reader.body_data.body_data_imp.nifti_to_lps import load_nifti_lps
 
 volume, metadata = load_dicom_hu_lps(
@@ -235,6 +308,9 @@ volume, metadata = load_dicom_hu_lps(
     require_ct=True,            # reject non-CT series
     return_metadata=True,
 )
+
+available_series = list_dicom_series("path/to/dicom_dir")
+# Each item includes the UID, ordered file names, dimensions and geometry.
 
 volume, metadata = load_nifti_lps(
     "path/to/image.nii.gz",
@@ -250,6 +326,14 @@ DICOM metadata keys include `series_uid`, `series_depth`,
 `number_of_files`, and the source geometry (`source_size_xyz`,
 `source_spacing_xyz_mm`,
 `source_origin_lps_mm`, `source_direction_xyz_to_lps`).
+
+DICOM series discovery performs one pydicom header-only scan, groups and
+physically orders files by `SeriesInstanceUID`, then caches the directory index.
+The cache fingerprint includes the absolute path, file count, directory
+modification time, total file size and a file metadata digest. SimpleITK reads
+pixels only after one series has been selected. If the selected image is
+already identity-direction LPS at the requested isotropic spacing, the
+resampling step is skipped.
 
 NIfTI metadata keys include `modality` (`"CT"`, `"MR"` or `"UNKNOWN"`),
 `modality_source` and `modality_confidence`, the output geometry
@@ -309,7 +393,7 @@ from ct_mri_dicom_nii_reader.body_data.body_data_imp.slice_display import show_n
 from ct_mri_dicom_nii_reader.body_data.body_data_imp.numpy_3d_viewer import show_numpy_3d
 
 show_numpy_gray(slice_2d, vmin, vmax)   # 2-D window, array[x, y] -> pixel (x, y)
-show_numpy_3d(array_3d, vmin, vmax)     # 3-D window with z slider
+show_numpy_3d(array_3d, vmin, vmax, image_type=None, mmpd=1.0)  # 3-D window
 ```
 
 Both are blocking (they open a Tk main loop) and use
@@ -344,7 +428,10 @@ Three visualization modes are provided for `BodyData` volumes.
 ### 1. Single volume (grayscale)
 
 `BodyData.gui_preview()` opens a grayscale window with a bottom slice
-slider — see `show_numpy_3d` above.
+slider — see `show_numpy_3d` above. Its `Bone` checkbox is enabled for CT and
+CBCT volumes and disabled for MRI and mask volumes. When selected, the public
+3-D bone segmentation pipeline is used and non-bone pixels are displayed as
+black.
 
 ### 2. Two volumes (amber/cyan fusion)
 
@@ -354,11 +441,18 @@ background with amber edges, the moving volume contributes cyan edges, and
 where both edges overlap the colors add up to white.
 
 Its preview window has independent `Image 1`, `Image 2`, and `Boundary`
-checkboxes, all enabled by default. A single selected image is displayed as
-true RGB grayscale, optionally brightened at its boundaries. Two selected
-images are independently normalized to 0-255 and shown as an amber/cyan
-fusion. With neither image selected the canvas is black, including when only
-`Boundary` is enabled. These controls are exclusive to the two-image viewer.
+checkboxes, all enabled by default, plus a `Bone` checkbox disabled by
+default. A single selected image is displayed as true RGB grayscale,
+optionally brightened at its boundaries. Two selected images are independently
+normalized to 0-255 and shown as an amber/cyan fusion. With neither image
+selected the canvas is black, including when only `Boundary` or `Bone` is
+enabled.
+
+When `Bone` is selected, each CT/CBCT contribution uses its own public 3-D
+bone segmentation mask after its boundary has been calculated; MRI and mask
+contributions remain unchanged. All bone masks are prepared before the window
+opens and stored in packed form, so changing slices does not rerun the
+segmentation. These controls are exclusive to the two-image viewer.
 
 ```python
 from ct_mri_dicom_nii_reader import TwoImageFusionViewer
@@ -406,14 +500,14 @@ default upscaled size, rescale with the window while preserving the aspect
 ratio, and raise an `ImportError` with the tkinter installation command
 when tkinter is missing.
 
-While the slider is dragged, the viewer renders at a fixed frame rate
-instead of debouncing: the slider callback only records the latest slice
-index, a single background worker thread computes the NumPy RGB slices
-(dropping intermediate indices automatically), and the Tk main thread only
-converts the newest result into a `PhotoImage` and redraws the canvas.
-Stale worker results are rejected through a generation/index check, and
-normalized slices, boundaries, and completed layer combinations are reused
-from bounded LRU caches.
+Before any 3-D preview window opens, all slider frames are rendered in full.
+The single-image viewer prepares both normal and Bone frames, the two-image
+viewer prepares every checkbox combination, and the three-image viewer
+prepares the final fusion plus mask overlay. During interaction the slider
+callback records only the newest index and the fixed-rate Tk refresh selects
+an already rendered frame. Large two-image caches use temporary memory-mapped
+files rather than consuming unbounded RAM; they are removed when the window
+closes.
 
 ### Public display helpers
 

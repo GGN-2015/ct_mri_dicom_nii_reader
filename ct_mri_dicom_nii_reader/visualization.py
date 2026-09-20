@@ -21,13 +21,20 @@ available as :meth:`BodyData.gui_preview`.
 from __future__ import annotations
 
 import queue
+import tempfile
 import threading
 from collections import OrderedDict
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 
 from .body_data import BodyData, BodyDataNotInitialized
+from .body_data.body_data_imp._bone_mask import (
+    PackedBoneMasks,
+    _precompute_packed_bone_masks,
+    _unpack_bone_mask,
+)
 
 
 _FIXED_EDGE_COLOR = np.asarray((220.0, 145.0, 28.0), dtype=np.float32)
@@ -35,6 +42,10 @@ _MOVING_EDGE_COLOR = np.asarray((20.0, 225.0, 255.0), dtype=np.float32)
 _EDGE_FUSION_OPACITY = 0.48
 _MASK_OVERLAY_COLOR = np.asarray((255.0, 0.0, 0.0), dtype=np.float32)
 _MASK_OVERLAY_MAX_ALPHA = 0.5
+_FRAME_CACHE_RAM_LIMIT_BYTES = 512 * 1024 * 1024
+
+LayerSelection = tuple[bool, bool, bool, bool]
+FrameCache = dict[LayerSelection, np.ndarray]
 
 
 def _air_value(image_type: Optional[str]) -> float:
@@ -135,6 +146,9 @@ def _compose_edge_fusion_u8(
     moving_u8: np.ndarray,
     fixed_edge: Optional[np.ndarray] = None,
     moving_edge: Optional[np.ndarray] = None,
+    bone_only: bool = False,
+    fixed_bone_mask: Optional[np.ndarray] = None,
+    moving_bone_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compose the original fusion from independently normalized inputs."""
     fixed_rgb = np.repeat(fixed_u8[:, :, None], 3, axis=2).astype(np.float32)
@@ -143,16 +157,31 @@ def _compose_edge_fusion_u8(
     if moving_edge is None:
         moving_edge = _edge_strength(moving_u8)
 
-    fusion = fixed_rgb * 0.32
-    fusion += (
+    fixed_component = fixed_rgb * 0.32
+    fixed_component += (
         fixed_edge[:, :, None]
         * _FIXED_EDGE_COLOR
     )
-    fusion += (
+    moving_component = (
         moving_edge[:, :, None]
         * _EDGE_FUSION_OPACITY
         * _MOVING_EDGE_COLOR
     )
+    if bone_only:
+        if fixed_bone_mask is not None:
+            np.multiply(
+                fixed_component,
+                fixed_bone_mask[:, :, None],
+                out=fixed_component,
+            )
+        if moving_bone_mask is not None:
+            np.multiply(
+                moving_component,
+                moving_bone_mask[:, :, None],
+                out=moving_component,
+            )
+    fusion = fixed_component
+    fusion += moving_component
     return np.ascontiguousarray(
         np.clip(fusion, 0.0, 255.0), dtype=np.uint8
     )
@@ -166,15 +195,24 @@ def _compose_two_image_layers_u8(
     show_boundary: bool,
     fixed_edge: Optional[np.ndarray] = None,
     moving_edge: Optional[np.ndarray] = None,
+    bone_only: bool = False,
+    fixed_bone_mask: Optional[np.ndarray] = None,
+    moving_bone_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Compose one of the eight layer selections in the two-image viewer."""
+    """Compose one of the layer selections in the two-image viewer."""
     if not show_fixed and not show_moving:
         return np.zeros((*fixed_u8.shape, 3), dtype=np.uint8)
 
     if show_fixed and show_moving:
         if show_boundary:
             return _compose_edge_fusion_u8(
-                fixed_u8, moving_u8, fixed_edge, moving_edge
+                fixed_u8,
+                moving_u8,
+                fixed_edge,
+                moving_edge,
+                bone_only,
+                fixed_bone_mask,
+                moving_bone_mask,
             )
 
         fixed_color = (
@@ -185,6 +223,19 @@ def _compose_two_image_layers_u8(
             moving_u8[:, :, None].astype(np.float32)
             * (_MOVING_EDGE_COLOR / 255.0)
         )
+        if bone_only:
+            if fixed_bone_mask is not None:
+                np.multiply(
+                    fixed_color,
+                    fixed_bone_mask[:, :, None],
+                    out=fixed_color,
+                )
+            if moving_bone_mask is not None:
+                np.multiply(
+                    moving_color,
+                    moving_bone_mask[:, :, None],
+                    out=moving_color,
+                )
         return np.ascontiguousarray(
             np.clip(fixed_color + moving_color, 0.0, 255.0),
             dtype=np.uint8,
@@ -192,18 +243,22 @@ def _compose_two_image_layers_u8(
 
     grayscale = fixed_u8 if show_fixed else moving_u8
     rgb = np.repeat(grayscale[:, :, None], 3, axis=2)
-    if not show_boundary:
-        return np.ascontiguousarray(rgb)
+    if show_boundary:
+        edge = fixed_edge if show_fixed else moving_edge
+        if edge is None:
+            edge = _edge_strength(grayscale)
+        rgb = (
+            rgb.astype(np.float32)
+            + edge[:, :, None] * (255.0 * _EDGE_FUSION_OPACITY)
+        )
 
-    edge = fixed_edge if show_fixed else moving_edge
-    if edge is None:
-        edge = _edge_strength(grayscale)
-    brightened = (
-        rgb.astype(np.float32)
-        + edge[:, :, None] * (255.0 * _EDGE_FUSION_OPACITY)
+    selected_bone_mask = (
+        fixed_bone_mask if show_fixed else moving_bone_mask
     )
+    if bone_only and selected_bone_mask is not None:
+        np.multiply(rgb, selected_bone_mask[:, :, None], out=rgb)
     return np.ascontiguousarray(
-        np.clip(brightened, 0.0, 255.0), dtype=np.uint8
+        np.clip(rgb, 0.0, 255.0), dtype=np.uint8
     )
 
 
@@ -266,6 +321,320 @@ def _take_slice(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
     if axis == "s":
         return arr[:, :, index]
     raise ValueError("axis must be one of 'l', 'p', 's'")
+
+
+def _frame_cache_directory(
+    total_bytes: int,
+) -> Optional[tempfile.TemporaryDirectory]:
+    if total_bytes <= _FRAME_CACHE_RAM_LIMIT_BYTES:
+        return None
+    return tempfile.TemporaryDirectory(prefix="ct_mri_reader_frames_")
+
+
+def _allocate_frame_volume(
+    shape: tuple[int, ...],
+    cache_directory: Optional[tempfile.TemporaryDirectory],
+    name: str,
+) -> np.ndarray:
+    if cache_directory is None:
+        return np.empty(shape, dtype=np.uint8)
+    path = Path(cache_directory.name) / f"{name}.dat"
+    return np.memmap(path, mode="w+", dtype=np.uint8, shape=shape)
+
+
+def _release_frame_cache(
+    arrays: list[np.ndarray],
+    cache_directory: Optional[tempfile.TemporaryDirectory],
+) -> None:
+    seen = set()
+    for array in arrays:
+        owner = array
+        while isinstance(getattr(owner, "base", None), np.ndarray):
+            owner = owner.base
+        if id(owner) in seen:
+            continue
+        seen.add(id(owner))
+        if isinstance(owner, np.memmap):
+            owner.flush()
+            mmap = getattr(owner, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+    if cache_directory is not None:
+        cache_directory.cleanup()
+
+
+def _single_grayscale_frame(
+    image: np.ndarray,
+    edge: np.ndarray,
+    show_boundary: bool,
+    bone_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    if show_boundary:
+        frame = image.astype(np.float32)
+        frame += edge * (255.0 * _EDGE_FUSION_OPACITY)
+        frame = np.ascontiguousarray(
+            np.clip(frame, 0.0, 255.0), dtype=np.uint8
+        )
+    else:
+        frame = image.copy()
+    if bone_mask is not None:
+        np.multiply(frame, bone_mask, out=frame)
+    return frame.T
+
+
+def _precompute_two_image_frames(
+    composer: "MultimodalFusionComposer",
+) -> tuple[FrameCache, Optional[tempfile.TemporaryDirectory]]:
+    """Render every dual-view layer state before creating the Tk window."""
+    fixed = composer.get_fixed()
+    moving = composer.get_moving()
+    fixed_array = np.asarray(fixed._body_data)
+    moving_array = np.asarray(moving._body_data)
+    size_l, size_p, size_s = composer.get_size()
+
+    bone_masks = (
+        _precompute_packed_bone_masks(
+            fixed_array, fixed.get_type(), fixed.get_mmpd()
+        ),
+        _precompute_packed_bone_masks(
+            moving_array, moving.get_type(), moving.get_mmpd()
+        ),
+    )
+    has_fixed_bone = bone_masks[0] is not None
+    has_moving_bone = bone_masks[1] is not None
+    voxel_count = size_l * size_p * size_s
+    scalar_volume_count = (
+        4 + 2 * int(has_fixed_bone) + 2 * int(has_moving_bone)
+    )
+    rgb_volume_count = 2 + 2 * int(
+        has_fixed_bone or has_moving_bone
+    )
+    total_bytes = voxel_count * (
+        scalar_volume_count + 3 * rgb_volume_count
+    )
+    cache_directory = _frame_cache_directory(total_bytes)
+
+    scalar_shape = (size_s, size_p, size_l)
+    rgb_shape = (*scalar_shape, 3)
+    fixed_plain = _allocate_frame_volume(
+        scalar_shape, cache_directory, "fixed_plain"
+    )
+    fixed_boundary = _allocate_frame_volume(
+        scalar_shape, cache_directory, "fixed_boundary"
+    )
+    moving_plain = _allocate_frame_volume(
+        scalar_shape, cache_directory, "moving_plain"
+    )
+    moving_boundary = _allocate_frame_volume(
+        scalar_shape, cache_directory, "moving_boundary"
+    )
+    both_plain = _allocate_frame_volume(
+        rgb_shape, cache_directory, "both_plain"
+    )
+    both_boundary = _allocate_frame_volume(
+        rgb_shape, cache_directory, "both_boundary"
+    )
+
+    fixed_bone_plain = fixed_plain
+    fixed_bone_boundary = fixed_boundary
+    if has_fixed_bone:
+        fixed_bone_plain = _allocate_frame_volume(
+            scalar_shape, cache_directory, "fixed_bone_plain"
+        )
+        fixed_bone_boundary = _allocate_frame_volume(
+            scalar_shape, cache_directory, "fixed_bone_boundary"
+        )
+
+    moving_bone_plain = moving_plain
+    moving_bone_boundary = moving_boundary
+    if has_moving_bone:
+        moving_bone_plain = _allocate_frame_volume(
+            scalar_shape, cache_directory, "moving_bone_plain"
+        )
+        moving_bone_boundary = _allocate_frame_volume(
+            scalar_shape, cache_directory, "moving_bone_boundary"
+        )
+
+    both_bone_plain = both_plain
+    both_bone_boundary = both_boundary
+    if has_fixed_bone or has_moving_bone:
+        both_bone_plain = _allocate_frame_volume(
+            rgb_shape, cache_directory, "both_bone_plain"
+        )
+        both_bone_boundary = _allocate_frame_volume(
+            rgb_shape, cache_directory, "both_bone_boundary"
+        )
+
+    for index in range(size_s):
+        fixed_u8 = normalize_to_u8(
+            fixed_array[:, :, index], composer._fixed_window
+        )
+        moving_u8 = normalize_to_u8(
+            moving_array[:, :, index], composer._moving_window
+        )
+        fixed_edge = _edge_strength(fixed_u8)
+        moving_edge = _edge_strength(moving_u8)
+        fixed_plain[index] = _single_grayscale_frame(
+            fixed_u8, fixed_edge, False
+        )
+        fixed_boundary[index] = _single_grayscale_frame(
+            fixed_u8, fixed_edge, True
+        )
+        moving_plain[index] = _single_grayscale_frame(
+            moving_u8, moving_edge, False
+        )
+        moving_boundary[index] = _single_grayscale_frame(
+            moving_u8, moving_edge, True
+        )
+        both_plain[index] = np.transpose(
+            _compose_two_image_layers_u8(
+                fixed_u8,
+                moving_u8,
+                True,
+                True,
+                False,
+                fixed_edge,
+                moving_edge,
+            ),
+            (1, 0, 2),
+        )
+        both_boundary[index] = np.transpose(
+            _compose_two_image_layers_u8(
+                fixed_u8,
+                moving_u8,
+                True,
+                True,
+                True,
+                fixed_edge,
+                moving_edge,
+            ),
+            (1, 0, 2),
+        )
+
+        fixed_bone_mask = (
+            _unpack_bone_mask(bone_masks[0], index)
+            if bone_masks[0] is not None
+            else None
+        )
+        moving_bone_mask = (
+            _unpack_bone_mask(bone_masks[1], index)
+            if bone_masks[1] is not None
+            else None
+        )
+        if has_fixed_bone:
+            fixed_bone_plain[index] = _single_grayscale_frame(
+                fixed_u8, fixed_edge, False, fixed_bone_mask
+            )
+            fixed_bone_boundary[index] = _single_grayscale_frame(
+                fixed_u8, fixed_edge, True, fixed_bone_mask
+            )
+        if has_moving_bone:
+            moving_bone_plain[index] = _single_grayscale_frame(
+                moving_u8, moving_edge, False, moving_bone_mask
+            )
+            moving_bone_boundary[index] = _single_grayscale_frame(
+                moving_u8, moving_edge, True, moving_bone_mask
+            )
+        if has_fixed_bone or has_moving_bone:
+            both_bone_plain[index] = np.transpose(
+                _compose_two_image_layers_u8(
+                    fixed_u8,
+                    moving_u8,
+                    True,
+                    True,
+                    False,
+                    fixed_edge,
+                    moving_edge,
+                    True,
+                    fixed_bone_mask,
+                    moving_bone_mask,
+                ),
+                (1, 0, 2),
+            )
+            both_bone_boundary[index] = np.transpose(
+                _compose_two_image_layers_u8(
+                    fixed_u8,
+                    moving_u8,
+                    True,
+                    True,
+                    True,
+                    fixed_edge,
+                    moving_edge,
+                    True,
+                    fixed_bone_mask,
+                    moving_bone_mask,
+                ),
+                (1, 0, 2),
+            )
+
+    black = np.broadcast_to(
+        np.zeros((1, size_p, size_l, 3), dtype=np.uint8),
+        rgb_shape,
+    )
+    cache: FrameCache = {}
+    for show_fixed in (False, True):
+        for show_moving in (False, True):
+            for show_boundary in (False, True):
+                for show_bone in (False, True):
+                    key = (
+                        show_fixed,
+                        show_moving,
+                        show_boundary,
+                        show_bone,
+                    )
+                    if not show_fixed and not show_moving:
+                        cache[key] = black
+                    elif show_fixed and not show_moving:
+                        if show_bone:
+                            cache[key] = (
+                                fixed_bone_boundary
+                                if show_boundary
+                                else fixed_bone_plain
+                            )
+                        else:
+                            cache[key] = (
+                                fixed_boundary
+                                if show_boundary
+                                else fixed_plain
+                            )
+                    elif show_moving and not show_fixed:
+                        if show_bone:
+                            cache[key] = (
+                                moving_bone_boundary
+                                if show_boundary
+                                else moving_bone_plain
+                            )
+                        else:
+                            cache[key] = (
+                                moving_boundary
+                                if show_boundary
+                                else moving_plain
+                            )
+                    elif show_bone:
+                        cache[key] = (
+                            both_bone_boundary
+                            if show_boundary
+                            else both_bone_plain
+                        )
+                    else:
+                        cache[key] = (
+                            both_boundary if show_boundary else both_plain
+                        )
+    return cache, cache_directory
+
+
+def _precompute_three_image_frames(
+    composer: "MultimodalFusionComposer",
+) -> tuple[np.ndarray, Optional[tempfile.TemporaryDirectory]]:
+    """Render every final three-image slice before creating the window."""
+    size_l, size_p, size_s = composer.get_size()
+    shape = (size_s, size_p, size_l, 3)
+    total_bytes = size_l * size_p * size_s * 3
+    cache_directory = _frame_cache_directory(total_bytes)
+    frames = _allocate_frame_volume(shape, cache_directory, "three_image")
+    for index in range(size_s):
+        frames[index] = composer.make_slice("s", index)
+    return frames, cache_directory
 
 
 def _resampled_size(
@@ -480,7 +849,8 @@ class _SliceRenderWorker:
     dropped automatically. Finished results are tagged with their generation
     and index and handed back through a queue; the GUI rejects stale results
     by comparing them against the newest request. Bounded LRU caches retain
-    normalized components, edges, and completed layer combinations.
+    normalized components, edges, and completed layer combinations. Bone
+    masks are computed for the whole volume before this worker is started.
     """
 
     _CACHE_CAPACITY = 24
@@ -491,19 +861,23 @@ class _SliceRenderWorker:
         composer: MultimodalFusionComposer,
         cache_seed: Optional[
             tuple[
-                tuple[str, int, Optional[tuple[bool, bool, bool]]],
+                tuple[str, int, Optional[tuple[bool, bool, bool, bool]]],
                 np.ndarray,
             ]
         ] = None,
+        bone_masks: tuple[
+            Optional[PackedBoneMasks], Optional[PackedBoneMasks]
+        ] = (None, None),
     ) -> None:
         self._composer = composer
+        self._bone_masks = bone_masks
         self._condition = threading.Condition()
         self._request: Optional[
             tuple[
                 str,
                 int,
                 int,
-                Optional[tuple[bool, bool, bool]],
+                Optional[tuple[bool, bool, bool, bool]],
             ]
         ] = None
         self._stopped = False
@@ -524,7 +898,7 @@ class _SliceRenderWorker:
         axis: str,
         index: int,
         generation: int,
-        layers: Optional[tuple[bool, bool, bool]] = None,
+        layers: Optional[tuple[bool, bool, bool, bool]] = None,
     ) -> None:
         """Record the latest requested slice; older requests are dropped."""
         with self._condition:
@@ -593,9 +967,9 @@ class _SliceRenderWorker:
         self,
         axis: str,
         index: int,
-        layers: tuple[bool, bool, bool],
+        layers: tuple[bool, bool, bool, bool],
     ) -> np.ndarray:
-        show_fixed, show_moving, show_boundary = layers
+        show_fixed, show_moving, show_boundary, show_bone = layers
         if not show_fixed and not show_moving:
             fixed = _take_slice(
                 np.asarray(self._composer._fixed._body_data), axis, index
@@ -610,6 +984,18 @@ class _SliceRenderWorker:
             fixed_edge = self._edge(axis, index, 1, fixed_u8)
         if show_boundary and show_moving:
             moving_edge = self._edge(axis, index, 2, moving_u8)
+
+        fixed_bone_mask = None
+        moving_bone_mask = None
+        if show_bone and axis == "s":
+            if show_fixed and self._bone_masks[0] is not None:
+                fixed_bone_mask = _unpack_bone_mask(
+                    self._bone_masks[0], index
+                )
+            if show_moving and self._bone_masks[1] is not None:
+                moving_bone_mask = _unpack_bone_mask(
+                    self._bone_masks[1], index
+                )
         rgb = _compose_two_image_layers_u8(
             fixed_u8,
             moving_u8,
@@ -618,6 +1004,9 @@ class _SliceRenderWorker:
             show_boundary,
             fixed_edge,
             moving_edge,
+            show_bone,
+            fixed_bone_mask,
+            moving_bone_mask,
         )
         return np.transpose(rgb, (1, 0, 2))
 
@@ -625,7 +1014,7 @@ class _SliceRenderWorker:
         self,
         axis: str,
         index: int,
-        layers: Optional[tuple[bool, bool, bool]],
+        layers: Optional[tuple[bool, bool, bool, bool]],
     ) -> np.ndarray:
         key = (axis, index, layers)
         if key in self._cache:
@@ -677,13 +1066,11 @@ class _ComposerGuiViewer:
     def gui_preview(self) -> None:
         """Open the blocking preview window.
 
-        Slices are rendered at a fixed frame rate instead of debouncing the
-        slider: the slider callback only records the latest index, a single
-        background worker thread computes the NumPy RGB slices (with a small
-        LRU cache), and the Tk main thread only converts the newest result
-        into a PhotoImage and redraws the canvas. Stale results are rejected
-        through a generation/index check, and nothing is recomputed when the
-        displayed slice has not changed.
+        Every S-plane and control combination is rendered before the Tk
+        window is created. The slider callback only records the latest index;
+        a fixed-rate Tk update selects the corresponding cached frame and
+        redraws it without normalization, boundary detection, mask blending,
+        or multimodal composition during interaction.
 
         Raises:
             ImportError: When tkinter is not installed. The error message
@@ -701,9 +1088,27 @@ class _ComposerGuiViewer:
         composer = self._composer
         _, _, s_size = composer.get_size()
 
-        initial_rgb = composer.make_slice("s", 0)
+        is_two_image_viewer = composer.get_mask() is None
+        initial_layers: Optional[LayerSelection] = (
+            (True, True, True, False) if is_two_image_viewer else None
+        )
+        two_image_frames: Optional[FrameCache] = None
+        three_image_frames: Optional[np.ndarray] = None
+        if is_two_image_viewer:
+            two_image_frames, cache_directory = (
+                _precompute_two_image_frames(composer)
+            )
+            assert initial_layers is not None
+            initial_rgb = two_image_frames[initial_layers][0]
+            cached_arrays = list(two_image_frames.values())
+        else:
+            three_image_frames, cache_directory = (
+                _precompute_three_image_frames(composer)
+            )
+            initial_rgb = three_image_frames[0]
+            cached_arrays = [three_image_frames]
         initial_base = upscale_for_display(
-            Image.fromarray(initial_rgb, mode="RGB")
+            Image.fromarray(np.asarray(initial_rgb)).copy()
         )[0]
 
         root = tk.Tk()
@@ -712,10 +1117,10 @@ class _ComposerGuiViewer:
         canvas = tk.Canvas(root, highlightthickness=0, borderwidth=0)
         canvas.pack(fill=tk.BOTH, expand=True)
 
-        is_two_image_viewer = composer.get_mask() is None
         layer_vars = None
         layer_buttons = []
-        initial_layers = None
+        bone_var = None
+        bone_button = None
         if is_two_image_viewer:
             controls = tk.Frame(root)
             controls.pack(fill=tk.X, padx=8, pady=(6, 0))
@@ -732,7 +1137,11 @@ class _ComposerGuiViewer:
                 )
                 button.pack(side=tk.LEFT, padx=(0, 12))
                 layer_buttons.append(button)
-            initial_layers = (True, True, True)
+            bone_var = tk.BooleanVar(master=root, value=False)
+            bone_button = tk.Checkbutton(
+                controls, text="Bone", variable=bone_var
+            )
+            bone_button.pack(side=tk.LEFT)
 
         z_label = tk.Label(root)
         z_label.pack(pady=(6, 0))
@@ -747,20 +1156,26 @@ class _ComposerGuiViewer:
         )
         z_slider.pack(fill=tk.X, padx=8, pady=(0, 8))
 
-        worker = _SliceRenderWorker(
-            composer,
-            cache_seed=(("s", 0, initial_layers), initial_rgb),
-        )
-
         state = {
             "photo": None,
             "z": 0,  # index currently displayed
             "target": 0,  # latest slider index
-            "generation": 0,  # bumped on every target change
             "layers": initial_layers,
             "base": initial_base,
+            "rendered": (0, initial_layers),
             "needs_redraw": True,
         }
+
+        def make_base_image(index, layers):
+            if two_image_frames is not None:
+                assert layers is not None
+                frame = two_image_frames[layers][index]
+            else:
+                assert three_image_frames is not None
+                frame = three_image_frames[index]
+            return upscale_for_display(
+                Image.fromarray(np.asarray(frame)).copy()
+            )[0]
 
         def redraw():
             box_width = max(1, canvas.winfo_width())
@@ -777,54 +1192,35 @@ class _ComposerGuiViewer:
             z_label.configure(text=f"z = {state['z']}")
             state["needs_redraw"] = False
 
-        def apply_result(generation, index, rgb):
-            if generation != state["generation"] or index != state["target"]:
-                return
-            state["base"] = upscale_for_display(
-                Image.fromarray(rgb, mode="RGB")
-            )[0]
-            state["z"] = index
-            state["needs_redraw"] = True
-
         def update_slice(z_value):
             z = int(float(z_value))
             if z == state["target"]:
                 return
             state["target"] = z
-            state["generation"] += 1
-            if z != state["z"]:
-                worker.request(
-                    "s", z, state["generation"], state["layers"]
-                )
 
         def update_layers():
             assert layer_vars is not None
+            assert bone_var is not None
             layers = (
                 bool(layer_vars[0].get()),
                 bool(layer_vars[1].get()),
                 bool(layer_vars[2].get()),
+                bool(bone_var.get()),
             )
             if layers == state["layers"]:
                 return
             state["layers"] = layers
-            state["generation"] += 1
-            worker.request(
-                "s",
-                state["target"],
-                state["generation"],
-                layers,
-            )
 
         def on_configure(_event):
             state["needs_redraw"] = True
 
         def tick():
-            while True:
-                result = worker.poll_result()
-                if result is None:
-                    break
-                generation, _, index, rgb = result
-                apply_result(generation, index, rgb)
+            requested = (state["target"], state["layers"])
+            if requested != state["rendered"]:
+                state["base"] = make_base_image(*requested)
+                state["z"] = state["target"]
+                state["rendered"] = requested
+                state["needs_redraw"] = True
             if state["needs_redraw"]:
                 redraw()
             root.after(16, tick)
@@ -833,13 +1229,19 @@ class _ComposerGuiViewer:
         z_slider.configure(command=update_slice)
         for button in layer_buttons:
             button.configure(command=update_layers)
+        if bone_button is not None:
+            bone_button.configure(command=update_layers)
 
         base_width, base_height = state["base"].size
         controls_height = 132 if is_two_image_viewer else 100
         root.geometry(f"{base_width}x{base_height + controls_height}")
         root.after(16, tick)
-        root.mainloop()
-        worker.stop()
+        try:
+            root.mainloop()
+        finally:
+            state["photo"] = None
+            state["base"] = None
+            _release_frame_cache(cached_arrays, cache_directory)
 
 
 class TwoImageFusionViewer(_ComposerGuiViewer):

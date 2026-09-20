@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Literal, TypeAlias
 
 import numpy as np
+import pydicom
 import SimpleITK as sitk
+from pydicom.errors import InvalidDicomError
 
 
 Metadata: TypeAlias = dict[str, object]
@@ -25,6 +30,25 @@ _CLASSIFICATION_TAGS = {
     "table_feed_per_rotation": "0018|9310",
     "spiral_pitch_factor": "0018|9311",
 }
+
+_INDEX_TAGS = [
+    "SeriesInstanceUID",
+    "SeriesDescription",
+    "Rows",
+    "Columns",
+    "NumberOfFrames",
+    "InstanceNumber",
+    "ImageOrientationPatient",
+    "ImagePositionPatient",
+    "PixelSpacing",
+    "SpacingBetweenSlices",
+    "SliceThickness",
+]
+_DIRECTORY_INDEX_CACHE_CAPACITY = 8
+_DIRECTORY_INDEX_CACHE: "OrderedDict[tuple, tuple[_SeriesInfo, ...]]" = (
+    OrderedDict()
+)
+_DIRECTORY_INDEX_CACHE_LOCK = threading.Lock()
 
 
 def _normalized_identifier(value: object) -> str:
@@ -99,70 +123,262 @@ class _SeriesInfo:
     depth: int
     voxel_count: int
     single_file_dimension: int
+    description: str = ""
+    image_orientation_patient: tuple[float, ...] = ()
+    first_image_position_patient: tuple[float, ...] = ()
+    pixel_spacing: tuple[float, ...] = ()
+    spacing_between_slices: float | None = None
+
+
+def _float_tuple(value: object, expected_length: int) -> tuple[float, ...]:
+    try:
+        result = tuple(float(item) for item in value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ()
+    return result if len(result) == expected_length else ()
+
+
+def _positive_int(value: object, default: int = 1) -> int:
+    try:
+        converted = int(value)
+    except (TypeError, ValueError):
+        return default
+    return converted if converted > 0 else default
+
+
+def _directory_snapshot(
+    dicom_dir: Path,
+) -> tuple[tuple[str, int, int, int, str], list[Path]]:
+    resolved = dicom_dir.resolve()
+    directory_mtime_ns = resolved.stat().st_mtime_ns
+    files: list[Path] = []
+    total_size = 0
+    digest = hashlib.blake2b(digest_size=16)
+    for entry in sorted(resolved.iterdir(), key=lambda path: path.name.casefold()):
+        try:
+            if not entry.is_file():
+                continue
+            stat = entry.stat()
+        except OSError:
+            continue
+        files.append(entry)
+        total_size += stat.st_size
+        digest.update(entry.name.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+    fingerprint = (
+        str(resolved),
+        len(files),
+        directory_mtime_ns,
+        total_size,
+        digest.hexdigest(),
+    )
+    return fingerprint, files
+
+
+def _scan_dicom_headers(files: list[Path]) -> tuple[_SeriesInfo, ...]:
+    groups: dict[str, list[dict[str, object]]] = {}
+    for path in files:
+        try:
+            dataset = pydicom.dcmread(
+                path,
+                stop_before_pixels=True,
+                specific_tags=_INDEX_TAGS,
+                force=True,
+            )
+        except (InvalidDicomError, OSError, EOFError, ValueError):
+            continue
+
+        uid = str(getattr(dataset, "SeriesInstanceUID", "")).strip()
+        if not uid:
+            continue
+        frames = _positive_int(getattr(dataset, "NumberOfFrames", 1))
+        rows = _positive_int(getattr(dataset, "Rows", 0), default=0)
+        columns = _positive_int(getattr(dataset, "Columns", 0), default=0)
+        try:
+            instance_number = float(getattr(dataset, "InstanceNumber", "inf"))
+        except (TypeError, ValueError):
+            instance_number = float("inf")
+        groups.setdefault(uid, []).append(
+            {
+                "path": str(path),
+                "frames": frames,
+                "rows": rows,
+                "columns": columns,
+                "instance_number": instance_number,
+                "description": str(
+                    getattr(dataset, "SeriesDescription", "")
+                ).strip(),
+                "orientation": _float_tuple(
+                    getattr(dataset, "ImageOrientationPatient", ()), 6
+                ),
+                "position": _float_tuple(
+                    getattr(dataset, "ImagePositionPatient", ()), 3
+                ),
+                "pixel_spacing": _float_tuple(
+                    getattr(dataset, "PixelSpacing", ()), 2
+                ),
+                "spacing_between_slices": getattr(
+                    dataset,
+                    "SpacingBetweenSlices",
+                    getattr(dataset, "SliceThickness", None),
+                ),
+            }
+        )
+
+    series: list[_SeriesInfo] = []
+    for uid, records in groups.items():
+        reference_orientation = next(
+            (
+                record["orientation"]
+                for record in records
+                if record["orientation"]
+            ),
+            (),
+        )
+        normal = None
+        if reference_orientation:
+            orientation = np.asarray(reference_orientation, dtype=np.float64)
+            candidate = np.cross(orientation[:3], orientation[3:])
+            norm = float(np.linalg.norm(candidate))
+            if norm > 1e-8:
+                normal = candidate / norm
+
+        def slice_sort_key(record: dict[str, object]) -> tuple:
+            position = record["position"]
+            if normal is not None and position:
+                coordinate = float(
+                    np.dot(np.asarray(position, dtype=np.float64), normal)
+                )
+                return (
+                    0,
+                    coordinate,
+                    record["instance_number"],
+                    str(record["path"]).casefold(),
+                )
+            return (
+                1,
+                record["instance_number"],
+                str(record["path"]).casefold(),
+            )
+
+        records.sort(key=slice_sort_key)
+        first = records[0]
+        file_names = [str(record["path"]) for record in records]
+        depth = sum(int(record["frames"]) for record in records)
+        voxel_count = sum(
+            int(record["rows"])
+            * int(record["columns"])
+            * int(record["frames"])
+            for record in records
+        )
+        try:
+            slice_spacing = float(first["spacing_between_slices"])
+        except (TypeError, ValueError):
+            slice_spacing = None
+        series.append(
+            _SeriesInfo(
+                uid=uid,
+                file_names=file_names,
+                depth=depth,
+                voxel_count=voxel_count,
+                single_file_dimension=(
+                    3 if len(records) == 1 and depth > 1 else 2
+                ),
+                description=str(first["description"]),
+                image_orientation_patient=tuple(first["orientation"]),
+                first_image_position_patient=tuple(first["position"]),
+                pixel_spacing=tuple(first["pixel_spacing"]),
+                spacing_between_slices=slice_spacing,
+            )
+        )
+    return tuple(sorted(series, key=lambda info: info.uid))
+
+
+def _directory_index(dicom_dir: Path) -> tuple[_SeriesInfo, ...]:
+    fingerprint, files = _directory_snapshot(dicom_dir)
+    with _DIRECTORY_INDEX_CACHE_LOCK:
+        cached = _DIRECTORY_INDEX_CACHE.get(fingerprint)
+        if cached is not None:
+            _DIRECTORY_INDEX_CACHE.move_to_end(fingerprint)
+            return cached
+
+    index = _scan_dicom_headers(files)
+    with _DIRECTORY_INDEX_CACHE_LOCK:
+        _DIRECTORY_INDEX_CACHE[fingerprint] = index
+        _DIRECTORY_INDEX_CACHE.move_to_end(fingerprint)
+        while len(_DIRECTORY_INDEX_CACHE) > _DIRECTORY_INDEX_CACHE_CAPACITY:
+            _DIRECTORY_INDEX_CACHE.popitem(last=False)
+    return index
+
+
+def clear_dicom_directory_cache() -> None:
+    """Clear cached DICOM directory header indexes."""
+    with _DIRECTORY_INDEX_CACHE_LOCK:
+        _DIRECTORY_INDEX_CACHE.clear()
+
+
+def list_dicom_series(dicom_dir: str | Path) -> list[Metadata]:
+    """Return cached, pixel-free metadata for each series in a directory."""
+    directory = Path(dicom_dir).expanduser()
+    if not directory.is_dir():
+        raise NotADirectoryError(f"DICOM directory does not exist: {directory}")
+    return [
+        {
+            "series_uid": info.uid,
+            "series_description": info.description,
+            "file_names": tuple(info.file_names),
+            "number_of_files": len(info.file_names),
+            "series_depth": info.depth,
+            "series_voxel_count": info.voxel_count,
+            "image_orientation_patient": info.image_orientation_patient,
+            "first_image_position_patient": info.first_image_position_patient,
+            "pixel_spacing": info.pixel_spacing,
+            "spacing_between_slices": info.spacing_between_slices,
+        }
+        for info in _directory_index(directory)
+    ]
 
 
 def _inspect_series(dicom_dir: Path, uid: str) -> _SeriesInfo:
-    file_names = list(
-        sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(dicom_dir), uid)
-    )
-    if not file_names:
-        raise ValueError(f"DICOM series contains no readable files: {uid}")
-
-    # Series members are expected to have the same matrix size. Reading only
-    # the first header avoids loading every candidate series into memory.
-    header_reader = sitk.ImageFileReader()
-    header_reader.SetFileName(file_names[0])
-    header_reader.ReadImageInformation()
-    single_file_size = tuple(int(value) for value in header_reader.GetSize())
-    single_file_dimension = header_reader.GetDimension()
-    frames_per_file = int(np.prod(single_file_size[2:], dtype=np.int64))
-    depth = max(1, frames_per_file) * len(file_names)
-    voxel_count = int(np.prod(single_file_size, dtype=np.int64)) * len(file_names)
-    return _SeriesInfo(
-        uid=uid,
-        file_names=file_names,
-        depth=depth,
-        voxel_count=voxel_count,
-        single_file_dimension=single_file_dimension,
-    )
+    matches = {
+        info.uid: info
+        for info in _directory_index(dicom_dir)
+    }
+    try:
+        return matches[uid]
+    except KeyError as exc:
+        raise ValueError(f"DICOM series contains no readable files: {uid}") from exc
 
 
 def _choose_series(dicom_dir: Path, series_uid: str | None) -> _SeriesInfo:
-    series_uids = list(sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(dicom_dir)) or [])
-    if not series_uids:
+    series = _directory_index(dicom_dir)
+    if not series:
         raise ValueError(f"No DICOM series found in: {dicom_dir}")
 
     if series_uid is not None:
-        if series_uid not in series_uids:
+        matches = {info.uid: info for info in series}
+        if series_uid not in matches:
             raise ValueError(
                 f"Series UID {series_uid!r} was not found. "
-                f"Available UIDs: {', '.join(series_uids)}"
+                f"Available UIDs: {', '.join(matches)}"
             )
-        return _inspect_series(dicom_dir, series_uid)
+        return matches[series_uid]
 
-    candidates: list[_SeriesInfo] = []
-    inspection_errors: list[str] = []
-    for uid in sorted(series_uids):
-        try:
-            info = _inspect_series(dicom_dir, uid)
-        except (RuntimeError, ValueError) as exc:
-            inspection_errors.append(f"{uid}: {exc}")
-            continue
-        if info.depth > 1:
-            candidates.append(info)
+    candidates = [info for info in series if info.depth > 1]
 
     if not candidates:
-        details = (
-            f" Header errors: {'; '.join(inspection_errors)}" if inspection_errors else ""
-        )
         raise ValueError(
             "No multi-slice DICOM series was found after excluding single-slice "
-            f"series.{details}"
+            "series."
         )
 
     largest_voxel_count = max(info.voxel_count for info in candidates)
     tied = [info for info in candidates if info.voxel_count == largest_voxel_count]
-    # Candidates were inspected in sorted UID order, making ties deterministic.
+    # The index is sorted by UID, making ties deterministic.
     return min(tied, key=lambda info: info.uid)
 
 
@@ -235,6 +451,22 @@ def _resample_to_isotropic_lps(
     interpolation: Literal["linear", "nearest"],
     outside_hu: float,
 ) -> sitk.Image:
+    interpolators = {
+        "linear": sitk.sitkLinear,
+        "nearest": sitk.sitkNearestNeighbor,
+    }
+    try:
+        sitk_interpolator = interpolators[interpolation]
+    except KeyError as exc:
+        raise ValueError("interpolation must be 'linear' or 'nearest'") from exc
+
+    spacing = np.asarray(image.GetSpacing(), dtype=np.float64)
+    direction = np.asarray(image.GetDirection(), dtype=np.float64).reshape(3, 3)
+    if np.allclose(spacing, mmpd, rtol=1e-7, atol=1e-7) and np.allclose(
+        direction, np.eye(3), rtol=0.0, atol=1e-7
+    ):
+        return image
+
     lower_edge, upper_edge = _image_support_bounds_lps(image)
     size_ratio = (upper_edge - lower_edge) / mmpd
 
@@ -247,15 +479,6 @@ def _resample_to_isotropic_lps(
     )
     output_size = np.maximum(1, np.ceil(size_ratio).astype(np.int64))
     output_origin = lower_edge + 0.5 * mmpd
-
-    interpolators = {
-        "linear": sitk.sitkLinear,
-        "nearest": sitk.sitkNearestNeighbor,
-    }
-    try:
-        sitk_interpolator = interpolators[interpolation]
-    except KeyError as exc:
-        raise ValueError("interpolation must be 'linear' or 'nearest'") from exc
 
     resampler = sitk.ResampleImageFilter()
     resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
@@ -345,8 +568,17 @@ def load_dicom_hu_lps(
         "spacing_lps_mm": (mmpd, mmpd, mmpd),
         "origin_lps_mm": tuple(float(value) for value in output_image.GetOrigin()),
         "series_uid": selected_series.uid,
+        "series_description": selected_series.description,
         "series_depth": selected_series.depth,
         "series_voxel_count": selected_series.voxel_count,
+        "image_orientation_patient": (
+            selected_series.image_orientation_patient
+        ),
+        "first_image_position_patient": (
+            selected_series.first_image_position_patient
+        ),
+        "pixel_spacing": selected_series.pixel_spacing,
+        "spacing_between_slices": selected_series.spacing_between_slices,
         "modality": modality,
         "dicom_modality": dicom_modality or "UNKNOWN",
         "modality_source": modality_source,
@@ -367,4 +599,8 @@ def load_dicom_hu_lps(
     return volume_lps, metadata
 
 
-__all__ = ["load_dicom_hu_lps"]
+__all__ = [
+    "clear_dicom_directory_cache",
+    "list_dicom_series",
+    "load_dicom_hu_lps",
+]

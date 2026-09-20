@@ -4,6 +4,7 @@ from . import nifti_to_lps
 from . import mind_3d
 from . import volume_percentile
 from . import numpy_3d_viewer
+from . import projection_comparison
 
 __all__ = [
     "dicom_to_hu_lps",
@@ -12,4 +13,5 @@ __all__ = [
     "mind_3d",
     "volume_percentile",
     "numpy_3d_viewer",
+    "projection_comparison",
 ]

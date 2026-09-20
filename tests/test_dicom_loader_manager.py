@@ -44,3 +44,28 @@ def test_manager_uses_dicom_loader_for_dicom_with_numeric_suffix(tmp_path):
 
     assert result is sentinel
     load.assert_called_once_with(str(file))
+
+
+def test_manager_forwards_series_uid_to_dicom_loader(tmp_path):
+    file = tmp_path / "slice.dcm"
+    file.touch()
+    series_uid = "1.2.826.0.1.3680043.10.1000.42"
+    sentinel = object()
+
+    with (
+        patch.object(
+            DicomBodyDataLoader,
+            "set_series_uid",
+        ) as set_series_uid,
+        patch.object(
+            DicomBodyDataLoader,
+            "load_file",
+            return_value=sentinel,
+        ),
+    ):
+        result = BodyDataLoaderManager().load_file(
+            str(file), series_uid=series_uid
+        )
+
+    assert result is sentinel
+    set_series_uid.assert_called_once_with(series_uid)

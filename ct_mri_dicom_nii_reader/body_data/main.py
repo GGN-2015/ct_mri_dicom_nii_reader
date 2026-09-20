@@ -16,6 +16,8 @@ from .body_data_imp.mind_3d import compute_mind_image
 from .body_data_imp.volume_percentile import get_volume_percentile
 from .body_data_imp.slice_display import show_numpy_gray
 from .body_data_imp.numpy_3d_viewer import show_numpy_3d
+from .body_data_imp.projection_comparison import show_projection_comparison
+from ..projection import get_lps_max_projections
 
 class DataLoaderNotMatch(Exception):
     def __init__(self, *args: object) -> None:
@@ -96,6 +98,19 @@ class BodyDataLoader(ABC):
 class DicomBodyDataLoader(BodyDataLoader):
     def __init__(self) -> None:
         BodyDataLoader.__init__(self)
+        self._series_uid: Optional[str] = None
+
+    def get_series_uid(self) -> Optional[str]:
+        return self._series_uid
+
+    def set_series_uid(self, series_uid: Optional[str]) -> None:
+        if series_uid is not None:
+            if not isinstance(series_uid, str):
+                raise TypeError("series_uid must be a string or None")
+            series_uid = series_uid.strip()
+            if not series_uid:
+                raise ValueError("series_uid must not be empty")
+        self._series_uid = series_uid
 
     def check_match(self, filepath:str) -> bool:
         if filepath.lower().endswith(".dcm"):
@@ -125,6 +140,7 @@ class DicomBodyDataLoader(BodyDataLoader):
         arr3d, metadata = load_dicom_hu_lps(
             os.path.dirname(filepath),
             self.get_mmpd(),
+            series_uid=self.get_series_uid(),
             require_ct=False,
             return_metadata=True)
         modality = str(metadata["modality"]).lower()
@@ -341,6 +357,18 @@ class BodyData:
         body_slice.set_body_data(self)
         return body_slice
 
+    def _make_body_data_slice_from_array(
+        self, data:numpy.ndarray
+    ) -> 'BodyDataSlice':
+        if not self.get_initialized():
+            raise BodyDataNotInitialized()
+        assert self._image_type is not None
+        body_slice = BodyDataSlice()
+        body_slice.from_array(data, self._image_type)
+        body_slice.set_mmpd(self.get_mmpd())
+        body_slice.set_body_data(self)
+        return body_slice
+
     def get_slice_l(self, l:int) -> BodyDataSlice:
         return self._make_body_data_slice_from_slice(
             numpy.s_[l, :, :]
@@ -354,6 +382,58 @@ class BodyData:
     def get_slice_s(self, s:int) -> BodyDataSlice:
         return self._make_body_data_slice_from_slice(
             numpy.s_[:, :, s]
+        )
+
+    def getProjectSlices(
+        self,
+    ) -> Tuple[BodyDataSlice, BodyDataSlice, BodyDataSlice]:
+        """Return maximum projections on the PS, SL and LP planes.
+
+        The source volume is ordered ``(L, P, S)``. Each projection takes the
+        maximum along the omitted dimension, and the returned tuple is always
+        ordered ``(PS, SL, LP)``.
+        """
+        if not self.get_initialized():
+            raise BodyDataNotInitialized()
+        ps, sl, lp = get_lps_max_projections(self._body_data)
+        return (
+            self._make_body_data_slice_from_array(ps),
+            self._make_body_data_slice_from_array(sl),
+            self._make_body_data_slice_from_array(lp),
+        )
+
+    def guiCompare(self, rhs:'BodyData') -> None:
+        """Compare this volume's PS, SL and LP projections with ``rhs``.
+
+        The first row belongs to this object (Image1), and the second row
+        belongs to ``rhs`` (Image2). When their voxel spacing differs, both
+        comparison volumes use the larger mmpd before projection. The call
+        blocks until the window closes.
+        """
+        if not isinstance(rhs, BodyData):
+            raise TypeError("rhs must be a BodyData instance")
+        if not self.get_initialized() or not rhs.get_initialized():
+            raise BodyDataNotInitialized()
+
+        lhs = self
+        comparison_rhs = rhs
+        if not numpy.isclose(self.get_mmpd(), rhs.get_mmpd()):
+            from ..visualization import resample_to_mmpd
+
+            comparison_mmpd = max(self.get_mmpd(), rhs.get_mmpd())
+            lhs = resample_to_mmpd(self, comparison_mmpd)
+            comparison_rhs = resample_to_mmpd(rhs, comparison_mmpd)
+
+        lhs_slices = lhs.getProjectSlices()
+        rhs_slices = comparison_rhs.getProjectSlices()
+        show_projection_comparison(
+            tuple(item.to_numpy(copy=False) for item in lhs_slices),
+            tuple(item.to_numpy(copy=False) for item in rhs_slices),
+            (lhs.percentile(1), lhs.percentile(99)),
+            (
+                comparison_rhs.percentile(1),
+                comparison_rhs.percentile(99),
+            ),
         )
 
     def clone(self) -> 'BodyData':
@@ -416,7 +496,12 @@ class BodyData:
 
     def gui_preview(self) -> None:
         show_numpy_3d(
-            self._body_data, self.percentile(1), self.percentile(99))
+            self._body_data,
+            self.percentile(1),
+            self.percentile(99),
+            image_type=self.get_type(),
+            mmpd=self.get_mmpd(),
+        )
 
 class BodyDataLoaderManager:
     def __init__(self) -> None:
@@ -426,11 +511,22 @@ class BodyDataLoaderManager:
             UnifiedBodyDataLoader()
         ]
 
-    def load_file(self, filepath:str, mmpd:Optional[float]=None) -> BodyData:
+    def load_file(
+        self,
+        filepath: str,
+        mmpd: Optional[float] = None,
+        series_uid: Optional[str] = None,
+    ) -> BodyData:
         if mmpd is None:
             mmpd = 1.0
         for loader in self._loader_list:
             if loader.check_match(filepath):
                 loader.set_mmpd(mmpd)
+                if isinstance(loader, DicomBodyDataLoader):
+                    loader.set_series_uid(series_uid)
+                elif series_uid is not None:
+                    raise ValueError(
+                        "series_uid is only valid when loading DICOM files"
+                    )
                 return loader.load_file(filepath)
         raise NoAvailableDataLoader(filepath)

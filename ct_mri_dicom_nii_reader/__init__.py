@@ -32,6 +32,19 @@ from .visualization import (
     normalize_to_u8,
     resample_to_mmpd,
 )
+from .bone_segmentation import (
+    BoneImageType,
+    apply_bone_mask,
+    estimate_bone_thresholds,
+    extract_bone_mask,
+    extract_cbct_bone_mask,
+    extract_ct_bone_mask,
+)
+from .projection import (
+    ProjectionPlane,
+    get_lps_max_projections,
+    max_intensity_projection,
+)
 
 __all__ = [
     "DataLoaderNotMatch",
@@ -53,4 +66,13 @@ __all__ = [
     "display_window",
     "normalize_to_u8",
     "resample_to_mmpd",
+    "BoneImageType",
+    "apply_bone_mask",
+    "estimate_bone_thresholds",
+    "extract_bone_mask",
+    "extract_cbct_bone_mask",
+    "extract_ct_bone_mask",
+    "ProjectionPlane",
+    "get_lps_max_projections",
+    "max_intensity_projection",
 ]
