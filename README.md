@@ -200,12 +200,14 @@ cbct_mask = extract_cbct_bone_mask(cbct_array, mmpd=cbct_mmpd)
 ```
 
 CT defaults to a 100 HU candidate threshold and a 300 HU high-confidence
-seed threshold. CBCT estimates both thresholds from a robust three-class
-histogram of each volume, so it does not assume that pseudo-HU values are
-portable between scanners. Lower-threshold voxels are retained only when
-3-D-connected to high-confidence bone. A small closing operation repairs
-narrow cortical gaps, and isolated components below a physical volume are
-removed. All mask extraction is completed before a preview window opens.
+seed threshold. CBCT divides its robust histogram into five density levels
+and locates the strongest upper-density transition, so air and soft tissue
+cannot dominate the pseudo-HU threshold. Small CBCT seed components are
+removed before lower-threshold reconstruction, preventing isolated bright
+noise from growing into large false-positive regions. Final CBCT component
+filtering adapts to the physical field-of-view volume; CT retains its fixed
+8 mm3 default. A small closing operation repairs narrow cortical gaps. All
+mask extraction is completed before a preview window opens.
 
 ## API reference
 

@@ -12,6 +12,10 @@ BoneImageType = Literal["ct", "cbct"]
 _CT_LOW_THRESHOLD_HU = 100.0
 _CT_HIGH_THRESHOLD_HU = 300.0
 _CBCT_HISTOGRAM_BINS = 256
+_CBCT_DENSITY_CLASSES = 5
+_CBCT_MIN_CLASS_WEIGHT = 0.005
+_CBCT_MIN_HIGH_DENSITY_FRACTION = 0.02
+_CBCT_MAX_HIGH_DENSITY_FRACTION = 0.35
 _THRESHOLD_SAMPLE_SIZE = 500_000
 
 
@@ -40,10 +44,92 @@ def _finite_sample(array: np.ndarray) -> np.ndarray:
     return sample[np.isfinite(sample)]
 
 
-def _cbct_three_class_statistics(
+def _optimal_histogram_partition(
+    histogram: np.ndarray,
+    centers: np.ndarray,
+    class_count: int,
+) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Partition a weighted 1-D histogram with exact dynamic programming."""
+    weights = np.asarray(histogram, dtype=np.float64)
+    centers = np.asarray(centers, dtype=np.float64)
+    bin_count = int(weights.size)
+    total_weight = float(weights.sum())
+    if class_count < 2 or total_weight <= 0.0:
+        return None
+
+    cumulative_weight = np.concatenate(([0.0], np.cumsum(weights)))
+    cumulative_sum = np.concatenate(([0.0], np.cumsum(weights * centers)))
+    cumulative_square_sum = np.concatenate(
+        ([0.0], np.cumsum(weights * centers * centers))
+    )
+    minimum_weight = total_weight * _CBCT_MIN_CLASS_WEIGHT
+
+    costs = np.full((class_count + 1, bin_count + 1), np.inf)
+    previous = np.full(
+        (class_count + 1, bin_count + 1), -1, dtype=np.int32
+    )
+    costs[0, 0] = 0.0
+
+    for classes in range(1, class_count + 1):
+        for end in range(classes, bin_count + 1):
+            starts = np.arange(classes - 1, end)
+            interval_weight = cumulative_weight[end] - cumulative_weight[starts]
+            valid = (
+                (interval_weight >= minimum_weight)
+                & np.isfinite(costs[classes - 1, starts])
+            )
+            if not np.any(valid):
+                continue
+            starts = starts[valid]
+            interval_weight = interval_weight[valid]
+            interval_sum = cumulative_sum[end] - cumulative_sum[starts]
+            interval_square_sum = (
+                cumulative_square_sum[end] - cumulative_square_sum[starts]
+            )
+            within_class_error = interval_square_sum - (
+                interval_sum * interval_sum / interval_weight
+            )
+            scores = costs[classes - 1, starts] + np.maximum(
+                within_class_error, 0.0
+            )
+            best = int(np.argmin(scores))
+            costs[classes, end] = scores[best]
+            previous[classes, end] = int(starts[best])
+
+    if not np.isfinite(costs[class_count, bin_count]):
+        return None
+
+    intervals = []
+    end = bin_count
+    for classes in range(class_count, 0, -1):
+        start = int(previous[classes, end])
+        if start < 0:
+            return None
+        intervals.append((start, end))
+        end = start
+    intervals.reverse()
+
+    class_means = []
+    class_weights = []
+    separators = []
+    for index, (start, end) in enumerate(intervals):
+        weight = cumulative_weight[end] - cumulative_weight[start]
+        value_sum = cumulative_sum[end] - cumulative_sum[start]
+        class_means.append(value_sum / weight)
+        class_weights.append(weight / total_weight)
+        if index < len(intervals) - 1:
+            separators.append(end)
+    return (
+        np.asarray(class_means),
+        np.asarray(class_weights),
+        np.asarray(separators, dtype=np.int32),
+    )
+
+
+def _cbct_density_statistics(
     array: np.ndarray,
 ) -> Optional[tuple[float, float, float]]:
-    """Return middle mean, upper separator, and high-density mean."""
+    """Return lower-class mean, bone separator and high-density mean."""
     sample = _finite_sample(array)
     if sample.size == 0:
         return None
@@ -59,66 +145,44 @@ def _cbct_three_class_statistics(
         bins=_CBCT_HISTOGRAM_BINS,
         range=(low, high),
     )
-    probabilities = histogram.astype(np.float64)
-    probability_sum = float(probabilities.sum())
-    if probability_sum <= 0.0:
-        return None
-    probabilities /= probability_sum
     centers = (bin_edges[:-1] + bin_edges[1:]) * 0.5
-    cumulative_weight = np.cumsum(probabilities)
-    cumulative_mean = np.cumsum(probabilities * centers)
-    total_mean = cumulative_mean[-1]
-
-    best_score = -np.inf
-    best: Optional[tuple[int, float, float]] = None
-    minimum_class_weight = 0.005
-    for lower_separator in range(_CBCT_HISTOGRAM_BINS - 2):
-        weight_low = cumulative_weight[lower_separator]
-        if weight_low < minimum_class_weight:
-            continue
-
-        candidates = np.arange(
-            lower_separator + 1, _CBCT_HISTOGRAM_BINS - 1
+    maximum_classes = min(
+        _CBCT_DENSITY_CLASSES, int(np.count_nonzero(histogram))
+    )
+    partition = None
+    for class_count in range(maximum_classes, 1, -1):
+        partition = _optimal_histogram_partition(
+            histogram, centers, class_count
         )
-        weight_middle = cumulative_weight[candidates] - weight_low
-        weight_high = 1.0 - cumulative_weight[candidates]
-        valid = (
-            (weight_middle >= minimum_class_weight)
-            & (weight_high >= minimum_class_weight)
-        )
-        if not np.any(valid):
-            continue
-
-        candidates = candidates[valid]
-        weight_middle = weight_middle[valid]
-        weight_high = weight_high[valid]
-        mean_low = cumulative_mean[lower_separator] / weight_low
-        mean_middle = (
-            cumulative_mean[candidates]
-            - cumulative_mean[lower_separator]
-        ) / weight_middle
-        mean_high = (
-            total_mean - cumulative_mean[candidates]
-        ) / weight_high
-        scores = (
-            weight_low * (mean_low - total_mean) ** 2
-            + weight_middle * (mean_middle - total_mean) ** 2
-            + weight_high * (mean_high - total_mean) ** 2
-        )
-        local_index = int(np.argmax(scores))
-        if scores[local_index] > best_score:
-            best_score = float(scores[local_index])
-            best = (
-                int(candidates[local_index]),
-                float(mean_middle[local_index]),
-                float(mean_high[local_index]),
-            )
-
-    if best is None:
+        if partition is not None:
+            break
+    if partition is None:
         return None
-    upper_separator, mean_middle, mean_high = best
-    boundary = float(bin_edges[upper_separator + 1])
-    return mean_middle, boundary, mean_high
+
+    class_means, class_weights, separator_bins = partition
+    class_count = int(class_means.size)
+    first_upper_split = (class_count - 1) // 2
+    possible_splits = list(range(first_upper_split, class_count - 1))
+    preferred_splits = [
+        split
+        for split in possible_splits
+        if _CBCT_MIN_HIGH_DENSITY_FRACTION
+        <= float(class_weights[split + 1 :].sum())
+        <= _CBCT_MAX_HIGH_DENSITY_FRACTION
+    ]
+    if not preferred_splits:
+        preferred_splits = possible_splits
+    split = max(
+        preferred_splits,
+        key=lambda index: float(class_means[index + 1] - class_means[index]),
+    )
+
+    upper_weights = class_weights[split + 1 :]
+    upper_mean = float(
+        np.average(class_means[split + 1 :], weights=upper_weights)
+    )
+    boundary = float(bin_edges[int(separator_bins[split])])
+    return float(class_means[split]), boundary, upper_mean
 
 
 def estimate_bone_thresholds(
@@ -136,7 +200,7 @@ def estimate_bone_thresholds(
     if normalized_type == "ct":
         return _CT_LOW_THRESHOLD_HU, _CT_HIGH_THRESHOLD_HU
 
-    statistics = _cbct_three_class_statistics(values)
+    statistics = _cbct_density_statistics(values)
     if statistics is None:
         return float("inf"), float("inf")
     mean_middle, boundary, mean_high = statistics
@@ -154,17 +218,20 @@ def extract_bone_mask(
     *,
     low_threshold: Optional[float] = None,
     high_threshold: Optional[float] = None,
-    denoise_sigma_mm: float = 0.4,
+    denoise_sigma_mm: Optional[float] = None,
     closing_radius_mm: float = 1.0,
-    minimum_component_volume_mm3: float = 8.0,
+    minimum_component_volume_mm3: Optional[float] = None,
+    minimum_seed_volume_mm3: Optional[float] = None,
     fully_connected: bool = True,
 ) -> np.ndarray:
     """Extract a three-dimensional CT or CBCT bone mask.
 
-    High-threshold voxels form confident bone seeds. Binary reconstruction
-    retains lower-threshold partial-volume voxels only when connected to a
-    seed. A small physical-radius closing repairs narrow cortical breaks, and
-    connected components below the requested physical volume are removed.
+    High-threshold voxels form confident bone seeds. For CBCT, tiny seed
+    components are removed before binary reconstruction so isolated bright
+    noise cannot grow through the lower threshold. Reconstruction retains
+    lower-threshold partial-volume voxels only when connected to a seed. A
+    small physical-radius closing repairs narrow cortical breaks, and small
+    final connected components are removed.
 
     All spatial parameters use millimetres. Threshold overrides use the
     source intensity units: HU for CT and scanner-specific values for CBCT.
@@ -175,10 +242,30 @@ def extract_bone_mask(
     mmpd = float(mmpd)
     if not np.isfinite(mmpd) or mmpd <= 0.0:
         raise ValueError("mmpd must be finite and greater than zero")
+    physical_volume_mm3 = float(values.size) * (mmpd ** 3)
+    if denoise_sigma_mm is None:
+        denoise_sigma_mm = 0.6 if normalized_type == "cbct" else 0.4
+    if minimum_component_volume_mm3 is None:
+        minimum_component_volume_mm3 = (
+            max(64.0, physical_volume_mm3 * 1e-4)
+            if normalized_type == "cbct"
+            else 8.0
+        )
+    if minimum_seed_volume_mm3 is None:
+        minimum_seed_volume_mm3 = (
+            max(2.0, physical_volume_mm3 * 1e-6)
+            if normalized_type == "cbct"
+            else 0.0
+        )
+    denoise_sigma_mm = float(denoise_sigma_mm)
+    closing_radius_mm = float(closing_radius_mm)
+    minimum_component_volume_mm3 = float(minimum_component_volume_mm3)
+    minimum_seed_volume_mm3 = float(minimum_seed_volume_mm3)
     for name, value in (
         ("denoise_sigma_mm", denoise_sigma_mm),
         ("closing_radius_mm", closing_radius_mm),
         ("minimum_component_volume_mm3", minimum_component_volume_mm3),
+        ("minimum_seed_volume_mm3", minimum_seed_volume_mm3),
     ):
         if not np.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be finite and non-negative")
@@ -218,6 +305,19 @@ def extract_bone_mask(
 
     seeds = sitk.Cast(image >= high, sitk.sitkUInt8)
     candidates = sitk.Cast(image >= low, sitk.sitkUInt8)
+    minimum_seed_voxels = int(
+        np.ceil(float(minimum_seed_volume_mm3) / (mmpd ** 3))
+    )
+    if minimum_seed_voxels > 1:
+        seed_components = sitk.ConnectedComponent(
+            seeds, bool(fully_connected)
+        )
+        seed_components = sitk.RelabelComponent(
+            seed_components,
+            minimum_seed_voxels,
+            False,
+        )
+        seeds = sitk.Cast(seed_components > 0, sitk.sitkUInt8)
     mask = sitk.BinaryReconstructionByDilation(
         seeds,
         candidates,

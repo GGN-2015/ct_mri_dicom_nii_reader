@@ -106,6 +106,47 @@ def test_cbct_thresholds_and_mask_are_affine_intensity_invariant():
     np.testing.assert_array_equal(mask, transformed_mask)
 
 
+def test_cbct_uses_the_high_density_tail_in_a_multimodal_scan():
+    rng = np.random.default_rng(41)
+    values = np.concatenate(
+        (
+            rng.normal(-900.0, 30.0, 20_000),
+            rng.normal(-350.0, 45.0, 25_000),
+            rng.normal(-50.0, 40.0, 35_000),
+            rng.normal(220.0, 45.0, 17_000),
+            rng.normal(760.0, 70.0, 3_000),
+        )
+    ).reshape(100, 100, 10)
+
+    low, high = estimate_bone_thresholds(values, "cbct")
+
+    assert np.percentile(values[values < 400.0], 99.5) < low
+    assert low < high < np.percentile(values[values > 500.0], 50.0)
+
+
+def test_cbct_removes_bright_noise_without_losing_bone():
+    rng = np.random.default_rng(73)
+    volume = rng.normal(50.0, 25.0, (64, 64, 32)).astype(np.float32)
+    bone = np.zeros(volume.shape, dtype=bool)
+    bone[20:44, 20:44, 8:24] = True
+    volume[bone] = rng.normal(800.0, 50.0, int(bone.sum()))
+
+    noise = np.zeros(volume.shape, dtype=bool)
+    noise_starts = ((3, 3, 3), (52, 5, 8), (5, 52, 18), (52, 52, 25))
+    for start in noise_starts:
+        slices = tuple(slice(value, value + 2) for value in start)
+        noise[slices] = True
+    volume[noise] = 1_100.0
+
+    mask = extract_cbct_bone_mask(volume, mmpd=1.0)
+
+    assert np.mean(mask[bone]) > 0.95
+    assert not np.any(mask[noise])
+    bone_neighborhood = np.zeros_like(bone)
+    bone_neighborhood[19:45, 19:45, 7:25] = True
+    assert np.count_nonzero(mask & ~bone_neighborhood) < 50
+
+
 def test_constant_cbct_returns_an_empty_mask():
     volume = np.full((5, 5, 5), 42.0, dtype=np.float32)
 
@@ -145,5 +186,7 @@ def test_invalid_public_bone_segmentation_arguments_are_rejected():
         extract_bone_mask(
             volume, "ct", low_threshold=300.0, high_threshold=100.0
         )
+    with pytest.raises(ValueError, match="minimum_seed_volume_mm3"):
+        extract_bone_mask(volume, "cbct", minimum_seed_volume_mm3=-1.0)
     with pytest.raises(ValueError, match="same shape"):
         apply_bone_mask(volume, np.zeros((2, 2, 2), dtype=bool))
